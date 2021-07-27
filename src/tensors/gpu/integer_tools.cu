@@ -148,7 +148,7 @@ namespace integer {
             // elements. This becomes the vector width of
             // math instructions in the epilogue too
         ElementAccumulator, // <- data type of accumulator
-        ElementCompute>;  // <- data type for alpha/beta in linear combination function
+        ElementCompute>;  // <- data type for alpha/beta in linear combination function // Change to half for pure half
 
     using EpilogueOpReluHalf = cutlass::epilogue::thread::LinearCombinationRelu<
         ElementOutputHalf, // <- data type of output matrix
@@ -157,13 +157,13 @@ namespace integer {
                   // elements. This becomes the vector width of
                   // math instructions in the epilogue too
         ElementAccumulator, // <- data type of accumulator
-        ElementCompute>;  // <- data type for alpha/beta in linear combination function
+        ElementCompute>;  // <- data type for alpha/beta in linear combination function // Change to half for pure half
 
         using CutlassGemmTensorOpHalf = cutlass::gemm::device::Gemm<int8_t,                            // ElementA
             cutlass::layout::RowMajor,         // LayoutA
             int8_t,                            // ElementB
             cutlass::layout::ColumnMajor,      // LayoutB
-            ElementOutputHalf,                             // ElementOutput
+            ElementOutputHalf,                 // ElementOutput
             cutlass::layout::ColumnMajor,      // LayoutOutput
             int32_t,                           // ElementAccumulator
             cutlass::arch::OpClassTensorOp,    // tag indicating Tensor Cores
@@ -178,7 +178,7 @@ namespace integer {
             cutlass::layout::RowMajor,         // LayoutA
             int8_t,                            // ElementB
             cutlass::layout::ColumnMajor,      // LayoutB
-            ElementOutputHalf,                             // ElementOutput
+            ElementOutputHalf,                 // ElementOutput
             cutlass::layout::ColumnMajor,      // LayoutOutput
             int32_t,                           // ElementAccumulator
             cutlass::arch::OpClassTensorOp,    // tag indicating Tensor Cores
@@ -586,12 +586,12 @@ namespace integer {
         int M,
         int N,
         int K,
-        float * alpha,
+        float * alpha, // Change to half for pure half
         int8_t const *A,
         int lda,
         int8_t const *B,
         int ldb,
-        float * beta,
+        float * beta, // Change to half for pure half
         half *C,
         int ldc,
         bool tensorCore, /*We want this to be true for best performance*/
@@ -628,6 +628,10 @@ namespace integer {
             }
         }
 
+    __global__ void halfConvertor(float * in, half * out) {
+        *out = __float2half(*in);
+    }
+
     void cutlass_igemm_dispatcher_half(bool transA, bool transB,
         int M,
         int N,
@@ -650,16 +654,28 @@ namespace integer {
             if (!tensorCore) {
                 printf("ERROR half gemm is only supported with tensocores");
             }
+            /* uncomment for pure half
+            static half * alpha_half;
+            static half * beta_half;
+            static bool initialized = false;
+            if (!initialized) {
+                CUDA_CHECK(cudaMalloc(&alpha_half, sizeof(half)));
+                CUDA_CHECK(cudaMalloc(&beta_half, sizeof(half)));
+                initialized = true;
+            }
+            halfConvertor<<<1,1>>>(alpha, alpha_half);
+            halfConvertor<<<1,1>>>(beta, beta_half);
+            CUDA_CHECK(cudaDeviceSynchronize());*/
             CUTLASS_CHECK(cutlass_igemm_nn_half(transA, transB,
                 M,
                 N,
                 K,
-                alpha,
+                alpha, // Change to alpha_half
                 A,
                 lda,
                 B,
                 ldb,
-                beta,
+                beta, // Change to alpha_half
                 C,
                 ldc,
                 tensorCore,
@@ -801,13 +817,14 @@ namespace integer {
                              const float *quantMultAddr) {
       const float quantMult
           = *quantMultAddr;  //@TODO ask nvidia if this is the most efficient way to do this here
+      const half quantMultHalf = __float2half(quantMult);
       size_t x = blockIdx.x * blockDim.x + threadIdx.x;
       int i = threadIdx.x;
-      __shared__ float share[256];  // Not sure if shared memory is necessary here to take advnatage
+      __shared__ half share[256];  // Not sure if shared memory is necessary here to take advnatage
                                     // of globale memory burst
       if(x < items) {
-        share[i] = __half2float(input[x]);
-        output[x] = (int8_t)max(-128, min(127, (int)rintf(share[i] * quantMult)));
+        share[i] = input[x];
+        output[x] = (int8_t)max(-128, min(127, __half2int_rn(share[i] * quantMultHalf)));
       }
     }
 
@@ -853,13 +870,14 @@ namespace integer {
                                        const float *quantMultAddr) {
       const float quantMult
           = *quantMultAddr;  // @TODO ask nvidia if this is the most efficient way to do this here
+      const half quantMultHalf = __float2half(quantMult);
       int row = blockIdx.y * blockDim.y + threadIdx.y;
       int col = blockIdx.x * blockDim.x + threadIdx.x;
 
       // input is col major, output is row major
       if(row * col < rows * cols) {
         output[cols * row + col]
-            = (int8_t)llrintf((__half2float(input[rows * col + row]) * quantMult));
+            = (int8_t) max(-128, min(127, __half2int_rn(input[rows * col + row] * quantMultHalf)));
       }
     }
 
