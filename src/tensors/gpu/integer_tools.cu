@@ -61,12 +61,12 @@ namespace integer {
     // Number of pipelines you want to use
     constexpr int NumStages = 2;
 #else
-    // Compute arch
+    // Compute arch: tuned for A100
     using SmArch = cutlass::arch::Sm80;
     // This code section describes the tile size a thread block will compute
-    using ShapeMMAThreadBlock = cutlass::gemm::GemmShape<128, 128, 64>;  // <- threadblock tile M = 128, N = 128, K = 16
+    using ShapeMMAThreadBlock = cutlass::gemm::GemmShape<64, 128, 128>;  // <- threadblock tile M = 128, N = 256, K = 64
     // This code section describes tile size a warp will compute
-    using ShapeMMAWarp = cutlass::gemm::GemmShape<64, 64, 64>;  // <- warp tile M = 64, N = 64, K = 16
+    using ShapeMMAWarp = cutlass::gemm::GemmShape<64, 32, 128>;  // <- warp tile M = 64, N = 64, K = 64
     // This code section describes the size of MMA op
     using ShapeMMAOp = cutlass::gemm::GemmShape<16, 8, 32>;  // <- MMA Op tile M = 16, N = 8, K = 8
     // This code section describes how threadblocks are scheduled on GPU
