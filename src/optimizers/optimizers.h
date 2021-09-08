@@ -142,11 +142,10 @@ protected:
   Ptr<TensorAllocator> baseAlloc_;
   Ptr<Allocator> alloc_;
 
+  Tensor avg_;
+
   Tensor pm_;
   Tensor gd_;
-
-public:
-  Tensor avg_;
 };
 
 /**

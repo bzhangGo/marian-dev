@@ -1,6 +1,5 @@
 #pragma once
 
-#include "optimizers/pruner.h"
 #include "optimizers/quantizer.h"
 #include "training/graph_group.h"
 
