@@ -318,7 +318,7 @@ public:
 
     // multiplicative attention with flattened softmax
     float scale = 1.0f / std::sqrt((float)dk); // scaling to avoid extreme values due to matrix multiplication
-    auto z = bdot(q, k, false, true, scale); // [-4: beam depth * batch size, -3: num heads, -2: max tgt length, -1: max src length]
+    auto z = bdot_legacy(q, k, false, true, scale); // [-4: beam depth * batch size, -3: num heads, -2: max tgt length, -1: max src length]
 
     // mask out garbage beyond end of sequences
     z = z + mask;
@@ -333,7 +333,7 @@ public:
     weights = dropout(weights, inference_ ? 0 : opt<float>("transformer-dropout-attention"));
 
     // apply attention weights to values
-    auto output = bdot(weights, v);   // [-4: beam depth * batch size, -3: num heads, -2: max tgt length, -1: split vector dim]
+    auto output = bdot_legacy(weights, v);   // [-4: beam depth * batch size, -3: num heads, -2: max tgt length, -1: split vector dim]
 
     return output;
   }
@@ -847,7 +847,9 @@ private:
         "vocab", opt<std::vector<std::string>>("vocabs")[batchIndex_], // for factored outputs
         "output-omit-bias", opt<bool>("output-omit-bias", false),
         "output-approx-knn", opt<std::vector<int>>("output-approx-knn", {}),
-        "lemma-dim-emb", opt<int>("lemma-dim-emb", 0)); // for factored outputs
+        "lemma-dim-emb", opt<int>("lemma-dim-emb", 0), // for factored outputs
+        "lemma-dependency", opt<std::string>("lemma-dependency", ""), // for factored outputs
+        "factors-combine", opt<std::string>("factors-combine", "")); // for factored outputs
 
     if(opt<bool>("tied-embeddings") || opt<bool>("tied-embeddings-all"))
       outputFactory.tieTransposed(opt<bool>("tied-embeddings-all") || opt<bool>("tied-embeddings-src") ? "Wemb" : prefix_ + "_Wemb");
