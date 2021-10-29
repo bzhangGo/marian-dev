@@ -9,9 +9,12 @@ add_subdirectory(./faiss)
 include_directories(./faiss)
 
 if(COMPILE_CPU)
+  set(DNNL_LIBRARY_TYPE "STATIC" CACHE STRING "Link to static DNNL library")
+  set(DNNL_BUILD_TESTS OFF CACHE BOOL "Disable dnnl tests")
+  set(DNNL_BUILD_EXAMPLES OFF CACHE BOOL "Disable dnnl examples")
+  set(DNNL_CPU_RUNTIME "SEQ" CACHE STRING "Disable multithreading within oneDNN")
   add_subdirectory(./oneDNN)
   include_directories(./oneDNN/include)
-  set(DNNL_BUILD_TESTS OFF CACHE BOOL "Disable dnnl tests")
 endif(COMPILE_CPU)
 
 if(USE_FBGEMM)
