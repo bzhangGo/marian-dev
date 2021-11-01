@@ -42,6 +42,8 @@ public:
 class ICriterionFunction {
 public:
   virtual ~ICriterionFunction() {}
+  
+  virtual Ptr<IModel> getModel() = 0;
 
   virtual void load(Ptr<ExpressionGraph>,
                     const std::string&,

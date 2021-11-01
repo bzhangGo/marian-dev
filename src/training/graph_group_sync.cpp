@@ -314,11 +314,19 @@ void SyncGraphGroup::update(std::vector<Ptr<data::Batch>> subBatches, size_t num
 
     // Overwrite gradNorm with new value from normalized gradient
     gradNorm = executeAndCollectNorm(update);
-    
+
+    // LOG(info, "gradNorm before normalisation??? {}", gradNorm);
+    // LOG(info, "gradNorm after normalisation??? {}", gradNorm); 
+    // update statistics for regularisers that use gradients information
+    // calculate updates only on models_[0] and copy them to others
+    updateRegularisationStatistics(gradNorm);
+
     if(!options_->get<bool>("normalize-gradient"))
       gradNorm /= updateTargetWords; // normalize for logging
 
     comm_->allGatherParams(); // distribute param value shards back
+
+
 
     // apply prune. Only do it on one machine.
     if (options_->get<std::string>("pruning-type") != "") {
@@ -400,6 +408,57 @@ void SyncGraphGroup::update(std::vector<Ptr<data::Batch>> subBatches, size_t num
 
   if(saneGradient)
     GraphGroup::increaseCostScaleFactor();
+}
+
+void SyncGraphGroup::updateRegularisationStatistics(float gradNorm) {
+  // perform everything on GPU/model 0
+ 
+  // LOG(info, "updateRegularisationStatistics()");
+  auto model = std::dynamic_pointer_cast<EncoderDecoder>(models_[0]->getModel());
+  if (!model) // if it's not enc dec model, then just ignore
+    return;
+
+  // calculate stuff for encoders
+  auto enc = model->getEncoders()[0];
+
+  auto regularisers = enc->getRegularisers();
+
+  // LOG(info, "regularisers size enc {}", regularisers.size());
+  for (int j = 0; j < regularisers.size(); j++) {
+    // LOG(info, "reg type {}", regularisers[j]->getType());
+    if (regularisers[j]->getType() == "aided") {
+      
+      // update stats
+      auto scalars = regularisers[j]->updateStats(graphs_[0], gradNorm);
+
+      // copy the new statistics across other models and graphs
+      for (int i = 1; i < models_.size(); i++) {
+        auto model2Sync = std::dynamic_pointer_cast<EncoderDecoder>(models_[i]->getModel());
+        auto enc2Sync = model2Sync->getEncoders()[0];
+        enc2Sync->getRegularisers()[j]->synchroStats(scalars);
+      }
+    }
+  }
+  
+  // calculate stuff for decoders
+  auto dec = model->getDecoders()[0];
+
+  regularisers = dec->getRegularisers();
+  for (int j = 0; j < regularisers.size(); j++) {
+    if (regularisers[j]->getType() == "aided") {
+      
+      // update stats
+      auto scalars = regularisers[j]->updateStats(graphs_[0], gradNorm);
+
+      // copy the new statistics across other models and graphs
+      for (int i = 1; i < models_.size(); i++) {
+        auto model2Sync = std::dynamic_pointer_cast<EncoderDecoder>(models_[i]->getModel());
+        auto dec2Sync = model2Sync->getDecoders()[0];
+        dec2Sync->getRegularisers()[j]->synchroStats(scalars);
+      }
+    }
+  }
+  
 }
 
 void SyncGraphGroup::finalize() /*override*/ {

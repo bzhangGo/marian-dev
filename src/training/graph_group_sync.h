@@ -25,6 +25,8 @@ class SyncGraphGroup : public GraphGroup {
 
   bool tryGetSubBatches(Ptr<data::Batch> newBatch, std::vector<Ptr<data::Batch>>& subBatches, size_t& numReadBatches);
   void update(std::vector<Ptr<data::Batch>> subBatches, size_t numReadBatches);
+  
+  void updateRegularisationStatistics(float gradNorm);
 
 public:
   SyncGraphGroup(Ptr<Options> config, Ptr<IMPIWrapper> mpi);

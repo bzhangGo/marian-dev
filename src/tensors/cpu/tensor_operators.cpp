@@ -931,6 +931,15 @@ void CrossEntropyPick(Tensor out, Tensor in, Tensor labelIndices, float labelSmo
     // This appears to be safe i.e. that i >= 0 && i < cols is known
     float logsumexp = std::log(sumexp);
     float ce = logsumexp - sp[i] + max; // -log(p_i) = - logsoftmax(x_i - max) = - (x_i - max) - log(sum_j exp(x_j - max))
+    
+    // the most stupid hack ever, beware kids
+
+    LOG(info, "normal ce {}", ce);
+    ce = std::exp(ce);
+    LOG(info, "exp(ce) {}", ce);
+    
+    
+    
     float ls = logsumexp - mean; 
     out->data()[j] = (1.f - labelSmoothingAlpha) * ce + labelSmoothingAlpha * ls;
   }
@@ -966,9 +975,11 @@ void CrossEntropyPickBackward(Tensor out,
     // cross-entropy
     for(int i = 0; i < cols; ++i) {
       float sub = (float)(i == (int)labelIndices->data<IndexType>()[j]); // delta, true if label index and column index match
-      float dce = std::exp(sp[i] - max) / sumexp - sub 
-                + labelSmoothingAlpha * (sub - 1.f / (float)cols);
-      so[i] += adj->data()[j] * dce;
+      float dce = -(1 / (std::exp(sp[i] - max) / sumexp - sub));
+
+      float dcesm = dce + labelSmoothingAlpha * (sub - 1.f / (float)cols);
+
+      so[i] += adj->data()[j] * dcesm;
     }
   }
 }

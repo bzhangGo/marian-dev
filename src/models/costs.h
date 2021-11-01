@@ -108,6 +108,7 @@ public:
             for(const auto& kv : r->getPartialPenalties()) {
               auto layerName    = kv.first;
               auto layerPenalty = r->getLambda() * kv.second;
+              // debug(layerPenalty, layerName);
               auto penaltyLoss  = RationalLoss(layerPenalty, 1, layerName);
               multiLoss->push_back(penaltyLoss);
               // std::cout << kv.first << " has value " << kv.second << std::endl;
@@ -280,7 +281,7 @@ public:
 
   virtual ~Trainer() {}
 
-  Ptr<IModel> getModel() { return model_; }
+  Ptr<IModel> getModel() override { return model_; }
 
   virtual void load(Ptr<ExpressionGraph> graph,
                     const std::string& name,
@@ -325,8 +326,6 @@ public:
   Scorer(Ptr<IModel> model, Ptr<ILogProb> cost) : model_(model), logProb_(cost) {}
 
   virtual ~Scorer() {}
-
-  Ptr<IModel> getModel() { return model_; }
 
   virtual void load(Ptr<ExpressionGraph> graph,
                     const std::string& name,

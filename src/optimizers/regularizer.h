@@ -29,8 +29,13 @@ protected:
 public:
   IRegulariser(Ptr<ExpressionGraph> graph, Ptr<Options> options, float lambda, std::string type)
       : graph_(graph), options_(options), lambda_(lambda), type_(type) {}
+  IRegulariser() {}
 
   virtual ~IRegulariser() {}
+
+  virtual std::map<std::string, float> updateStats(Ptr<ExpressionGraph> graph, float gradNorm) { return {  }; }
+
+  virtual void synchroStats(std::map<std::string, float> scalars) {}
 
   virtual float getLambda() { return lambda_; }
 
@@ -38,11 +43,12 @@ public:
 
   virtual Expr getTotalPenalty() {
     Expr totalPenalty;
+    // LOG(info, "IRegulariser getTotalPenalty wtf");
     for(const auto& partialPenalty : partialPenalties_) {
       if(!totalPenalty)
         totalPenalty = partialPenalty.second;
       else
-        totalPenalty = totalPenalty + lambda_ * partialPenalty.second;
+        totalPenalty = totalPenalty + partialPenalty.second;
     }
     return lambda_ * totalPenalty;
   }
@@ -55,6 +61,30 @@ public:
 
   virtual Expr calculatePenalty(Expr W, Expr b, bool rows = false, bool inference = false) = 0;
 };
+
+
+class IAidedRegulariser : public virtual IRegulariser {
+protected:
+  std::vector<Ptr<TensorAllocator>> allocators_;
+  std::map<std::string, float> scalars_; // Each penalty will be scaled independently
+  std::map<std::string, bool> flipped_; // Is it rows or columns
+
+public:
+  IAidedRegulariser(Ptr<ExpressionGraph> graph, Ptr<Options> options, float lambda, std::string type)
+      : IRegulariser(graph, options, lambda, type) {}
+  IAidedRegulariser() : IRegulariser() {}
+
+  virtual ~IAidedRegulariser() {}
+
+  void synchroStats(std::map<std::string, float> scalars) override {
+    // LOG(info, "SynchroStats");
+    scalars_ = scalars;
+  }
+
+  // void clear() override { partialPenalties_.clear(); }
+
+};
+
 
 class L0Regulariser : public IRegulariser {
 protected:
@@ -276,13 +306,14 @@ public:
   }
 };
 
-class GroupLassoRegulariser : public IRegulariser {
+class GroupLassoRegulariser : public virtual IRegulariser {
 public:
   GroupLassoRegulariser(Ptr<ExpressionGraph> graph,
                         Ptr<Options> options,
                         float lambda,
                         std::string type)
       : IRegulariser(graph, options, lambda, type) {}
+  GroupLassoRegulariser() : IRegulariser() {}
 
   Expr calculatePenalty(Expr W, Expr b, bool rows = false, bool inference = false) override {
     Expr p;
@@ -294,6 +325,8 @@ public:
       p = rowcolRootPenalty(W, b, rows);
     } else if(type_ == "layer") {
       p = layerPenalty(W, b, rows);
+    } else { // default to rowcol
+      p = rowcolPenalty(W, b, rows);
     }
 
     partialPenalties_.emplace(W->name(), p);
@@ -419,6 +452,118 @@ protected:
   }
 };
 
+
+class AidedGroupLassoRegulariser : public IAidedRegulariser, public GroupLassoRegulariser {
+protected:
+  std::vector<Ptr<TensorAllocator>> allocators_;
+  
+  Tensor tempAvg_; // temp variable to hold the new average
+  float alpha_{0.0001}; // alpha for exponential moving average of gradients
+
+  bool isInitialised_{false};
+
+public:
+  AidedGroupLassoRegulariser(Ptr<ExpressionGraph> graph, Ptr<Options> options, float lambda, std::string type)
+      : IRegulariser(graph, options, lambda, type) { LOG(info, "AidedGroupLasso constructor");}
+
+  using IAidedRegulariser::synchroStats;
+  using IAidedRegulariser::updateStats;
+
+  virtual ~AidedGroupLassoRegulariser() {}
+  
+  std::map<std::string, float> updateStats(Ptr<ExpressionGraph> graph, float gradNorm) override {
+
+    // LOG(info, "AidedGroupLasso UPDATE STAAAAAATS");
+
+    if(!graph_) {
+      LOG(info, "WHY IS GRAPH POINTER EMPTY HERE IN updateStats???");
+      graph_ = graph;
+    }
+
+    if (!tempAvg_) {
+        auto allocator = New<TensorAllocator>(graph_->getBackend());
+        allocator->reserveExact(graph_->params()->vals()->memory()->size());
+        allocator->allocate(tempAvg_, {1, 1});
+
+        // tempAvg_->set(0);
+
+        allocators_.push_back(allocator);
+    }
+
+    for (const auto &s : scalars_) { // for all layers that we regularise
+      auto name = s.first;
+      auto node = graph_->get(name);
+
+      if (!node)
+        LOG(info, "node of the name {} is nullptr???", name);
+
+      // Average the abs of gradients for the layer
+      
+      // float dim = node->shape()[1];
+      // if (flipped_[name])
+        // dim = node->shape()[0];
+
+      using namespace functional;
+      // Reduce(abs(_1), 1.0f / dim, tempAvg_, node->grad());
+      Reduce(_1 * _1, 1.0f, tempAvg_, node->grad());
+      // float newScalar = std::sqrt(tempAvg_->get(0)) * (1.0f / dim);
+      float sqrtScalar = std::sqrt(tempAvg_->get(0));
+      float newScalar = std::abs(std::log(sqrtScalar / gradNorm));
+      tempAvg_->set(0);
+
+      // float newScalar = 1.0f;
+
+      if (scalars_[name] == 0.0f) { // if no previous statistics were done
+        // LOG(info, "ZEROOOOOO");
+        scalars_[name] = newScalar; 
+      }
+      else { // do exponential moving average if previous statistic exist
+        scalars_[name] = alpha_ * newScalar + (1 - alpha_) * scalars_[name]; 
+      }
+
+      // LOG(info, "updatedStats, global gradNorm={}, node={}, gradScalar={}, sqrtScalar={}, scalar={} flipped={} dim={}", gradNorm, name, newScalar, sqrtScalar, scalars_[name], flipped_[name], dim); 
+    }
+
+    return scalars_;
+  }
+  
+  Expr calculatePenalty(Expr W, Expr b, bool rows = false, bool inference = false) override {
+    // if (scalars_.find(W->name()) == scalars_.end()) { // if scalar for the node doesn't yet exist 
+      // scalars_[W->name()] = 1.0f;
+    // }
+    // auto p = GroupLassoRegulariser::calculatePenalty(W, b, rows, inference);
+    
+    // store whether it's rows or columns
+    flipped_[W->name()] = rows;
+    
+    Expr p;
+    if(type_ == "rowcol") {
+      p = GroupLassoRegulariser::rowcolPenalty(W, b, rows);
+    } else if(type_ == "heads") {
+      p = GroupLassoRegulariser::headPenalty(W, b, rows);
+    } else if(type_ == "rowcol-root") {
+      p = GroupLassoRegulariser::rowcolRootPenalty(W, b, rows);
+    } else if(type_ == "layer") {
+      p = GroupLassoRegulariser::layerPenalty(W, b, rows);
+    } else { // default to rowcol
+      p = GroupLassoRegulariser::rowcolPenalty(W, b, rows);
+    }
+    // debug(p, "before scalar");
+    // LOG(info, "calculatePenalty AidedGroupLasso, node={} scalar={}", W->name(), scalars_[W->name()]);
+    // debug(p, W->name() + "NORMAL in calculatePenalty???");
+    if (scalars_[W->name()] != 0.0f) {
+      // LOG(info, "SCALING THE NODE {} {}", W->name(), p->shape());
+      p = p * scalars_[W->name()];
+    }
+    // debug(p, "after scalar");
+    partialPenalties_.emplace(W->name(), p);
+    // debug(p, W->name() + " SCALED in calculatePenalty???");
+    return p;
+  }
+
+};
+
+
 class RegulariserFactory : public Factory {
 public:
   using Factory::Factory;
@@ -458,6 +603,9 @@ public:
     } else if(type == "heads") {
       LOG_ONCE(info, "Regularisation type selected: group lasso, shape=heads");
       return New<GroupLassoRegulariser>(graph, options_, lambda, type);
+    } else if(type == "aided") {
+      LOG_ONCE(info, "Regularisation type selected: aided group lasso, shape=rowcol");
+      return New<AidedGroupLassoRegulariser>(graph, options_, lambda, type);
     } else {
       LOG_ONCE(
           info,
