@@ -174,6 +174,8 @@ struct PrepareBNodeOp : public UnaryNodeOp {
     } else {
       ret = input->shape();
     }
+    std::cerr << "PrepareB " << input->name() << " shape: old: " << rows(input->shape()) << "x" << cols(input->shape()) << 
+    " shape new: " << rows(ret) << "x" << cols(ret) << " transposed: " << std::boolalpha << transposed << std::endl;
     return ret;
   }
 
@@ -271,11 +273,13 @@ struct QuantMultANodeOp : public UnaryNodeOp {
 
 template<Type vtype> // Without the template marian thinks this is an instrusive ptr, I'm not sure why.
 struct PrepareBiasForBNodeOp : public NaryNodeOp {
-//private:
+private:
+  bool transposed_;
 //  ENABLE_INTRUSIVE_PTR(PrepareBiasForBNodeOp)
 public:
-  PrepareBiasForBNodeOp(Expr bias, Expr inputB_preppd, Expr inputA_preppd)
-      : NaryNodeOp({bias, inputB_preppd, inputA_preppd}, bias->shape(), Type::float32) {
+  PrepareBiasForBNodeOp(Expr bias, Expr inputB_preppd, Expr inputA_preppd, bool transB)
+      : NaryNodeOp({bias, inputB_preppd, inputA_preppd}, bias->shape(), Type::float32), 
+        transposed_(transB) {
 
     set_name(bias->name() + "_Prepared");
     if (bias->type() == "cols" && bias->graph()->getBackend()->isPrecomputedAlpha()) {
@@ -285,8 +289,9 @@ public:
     }
   }
 
-  PrepareBiasForBNodeOp(Expr bias, Expr inputB_preppd)
-      : NaryNodeOp({bias, inputB_preppd}, bias->shape(), Type::float32) {
+  PrepareBiasForBNodeOp(Expr bias, Expr inputB_preppd, bool transB)
+      : NaryNodeOp({bias, inputB_preppd}, bias->shape(), Type::float32), 
+        transposed_(transB) {
 
     set_name(bias->name() + "_Prepared");
     if (bias->type() == "cols" && bias->graph()->getBackend()->isPrecomputedAlpha()) {
@@ -317,27 +322,41 @@ public:
         const dnnl_dim_t M = 1;
         dnnl_dim_t K = rows(b);
         dnnl_dim_t N = cols(b);
+        if (transposed_) {
+          N = rows(b);
+          K = cols(b);
+        }
+
+        dnnl_dim_t lda = K;
+        dnnl_dim_t ldb = N;
+        dnnl_dim_t ldc = N;
+
+        char transB = transposed_ ? 'T' : 'N';
+
+        std::cerr << "Bname: " << child(1)->name() << " transposed: " << std::boolalpha << transposed_ <<
+        " Bshape: rows: " << rows(b) << " cols: " << cols(b) << "\nM: " << M << " K: " << K << " N: " << N <<
+        "\nda: " << lda << " ldb: " << ldb << " ldc: " << ldc  << " \nbias shape rows: " << rows(bias) << " cols: " << cols(bias) << "\n\n" << std::endl;
 
         const int8_t ao = 0;
         const int8_t bo = 0;
         static const std::vector<int32_t> co(1,0);
         ///std::array<int32_t, 1> co = {0}; // This syntax is not allowed due to being in a macro
         auto status = dnnl::gemm_u8s8s32(/*transA*/  'N',
-                                        /*transB*/  'N',
+                                        transB,
                                         /*OffsetC*/ 'F', /* This parameter denotes whether there can be bias adition. Sadly while it technically supports it, it's only int32_t.*/
                                         M,
                                         N,
                                         K,
                                         /*alpha*/ 1.0f,
                                         ones.data(),
-                                        /*lda*/ K,
+                                        lda,
                                         ao,
                                         b->template data<int8_t>(),
-                                        /*ldb*/ N,
+                                        ldb,
                                         bo,
                                         /*beta*/ 0.0f,
                                         val_->data<int32_t>(),
-                                        /*ldc*/ N,
+                                        ldc,
                                         co.data());
 
         if (status != dnnl::status::success) {
@@ -362,7 +381,7 @@ public:
 template<Type vtype> // Without the template marian thinks this is an instrusive ptr, I'm not sure why.
 class PrepareFakeBiasForBNodeOp : public NaryNodeOp {
 public:
-  PrepareFakeBiasForBNodeOp(Expr inputB_preppd, Expr inputA_preppd)
+  PrepareFakeBiasForBNodeOp(Expr inputB_preppd, Expr inputA_preppd, bool transB)
       : NaryNodeOp({inputB_preppd, inputA_preppd}, {1, inputB_preppd->shape()[-1]}, Type::float32) {
 
     set_name(inputB_preppd->name() + "_FakeBias");
@@ -371,7 +390,7 @@ public:
     }
   }
 
-  PrepareFakeBiasForBNodeOp(Expr inputB_preppd)
+  PrepareFakeBiasForBNodeOp(Expr inputB_preppd, bool transB)
       : NaryNodeOp({inputB_preppd}, {1, inputB_preppd->shape()[-1]}, Type::float32) {
 
     set_name(inputB_preppd->name() + "_FakeBias");
@@ -487,93 +506,93 @@ static Expr prepareBTyped(Expr input, bool transpose=false) {
 }
 
 
-static Expr PrepareTrueBiasForBTyped(Expr bias, Expr inputB_preppd, Expr inputA_preppd=nullptr) {
+static Expr PrepareTrueBiasForBTyped(Expr bias, Expr inputB_preppd, Expr inputA_preppd=nullptr, bool transB=false) {
   static const Type intgemmType = inputB_preppd->value_type();
   if (inputA_preppd) {
     switch(intgemmType) {
       case Type::intgemm8ssse3 :
-        return Expression<PrepareBiasForBNodeOp<Type::intgemm8ssse3> >(bias, inputB_preppd, inputA_preppd);
+        return Expression<PrepareBiasForBNodeOp<Type::intgemm8ssse3> >(bias, inputB_preppd, inputA_preppd, transB);
       case Type::intgemm8avx2 :
-        return Expression<PrepareBiasForBNodeOp<Type::intgemm8avx2> > (bias, inputB_preppd, inputA_preppd);
+        return Expression<PrepareBiasForBNodeOp<Type::intgemm8avx2> > (bias, inputB_preppd, inputA_preppd, transB);
       case Type::intgemm8avx512 :
-        return Expression<PrepareBiasForBNodeOp<Type::intgemm8avx512> >(bias, inputB_preppd, inputA_preppd);
+        return Expression<PrepareBiasForBNodeOp<Type::intgemm8avx512> >(bias, inputB_preppd, inputA_preppd, transB);
       case Type::intgemm8avx512vnni :
-        return Expression<PrepareBiasForBNodeOp<Type::intgemm8avx512vnni> > (bias, inputB_preppd, inputA_preppd);
+        return Expression<PrepareBiasForBNodeOp<Type::intgemm8avx512vnni> > (bias, inputB_preppd, inputA_preppd, transB);
       case Type::intgemm16sse2 :
-        return Expression<PrepareBiasForBNodeOp<Type::intgemm16sse2> >(bias, inputB_preppd, inputA_preppd);
+        return Expression<PrepareBiasForBNodeOp<Type::intgemm16sse2> >(bias, inputB_preppd, inputA_preppd, transB);
       case Type::intgemm16avx2 :
-        return Expression<PrepareBiasForBNodeOp<Type::intgemm16avx2> > (bias, inputB_preppd, inputA_preppd);
+        return Expression<PrepareBiasForBNodeOp<Type::intgemm16avx2> > (bias, inputB_preppd, inputA_preppd, transB);
       case Type::intgemm16avx512 :
-        return Expression<PrepareBiasForBNodeOp<Type::intgemm16avx512> > (bias, inputB_preppd, inputA_preppd);
+        return Expression<PrepareBiasForBNodeOp<Type::intgemm16avx512> > (bias, inputB_preppd, inputA_preppd, transB);
       default:
         ABORT("Unsupported type {} for Intgemm type??", intgemmType);
     }
   } else {
     switch(intgemmType) {
       case Type::intgemm8ssse3 :
-        return Expression<PrepareBiasForBNodeOp<Type::intgemm8ssse3> >(bias, inputB_preppd);
+        return Expression<PrepareBiasForBNodeOp<Type::intgemm8ssse3> >(bias, inputB_preppd, transB);
       case Type::intgemm8avx2 :
-        return Expression<PrepareBiasForBNodeOp<Type::intgemm8avx2> > (bias, inputB_preppd);
+        return Expression<PrepareBiasForBNodeOp<Type::intgemm8avx2> > (bias, inputB_preppd, transB);
       case Type::intgemm8avx512 :
-        return Expression<PrepareBiasForBNodeOp<Type::intgemm8avx512> >(bias, inputB_preppd);
+        return Expression<PrepareBiasForBNodeOp<Type::intgemm8avx512> >(bias, inputB_preppd, transB);
       case Type::intgemm8avx512vnni :
-        return Expression<PrepareBiasForBNodeOp<Type::intgemm8avx512vnni> > (bias, inputB_preppd);
+        return Expression<PrepareBiasForBNodeOp<Type::intgemm8avx512vnni> > (bias, inputB_preppd, transB);
       case Type::intgemm16sse2 :
-        return Expression<PrepareBiasForBNodeOp<Type::intgemm16sse2> >(bias, inputB_preppd);
+        return Expression<PrepareBiasForBNodeOp<Type::intgemm16sse2> >(bias, inputB_preppd, transB);
       case Type::intgemm16avx2 :
-        return Expression<PrepareBiasForBNodeOp<Type::intgemm16avx2> > (bias, inputB_preppd);
+        return Expression<PrepareBiasForBNodeOp<Type::intgemm16avx2> > (bias, inputB_preppd, transB);
       case Type::intgemm16avx512 :
-        return Expression<PrepareBiasForBNodeOp<Type::intgemm16avx512> > (bias, inputB_preppd);
+        return Expression<PrepareBiasForBNodeOp<Type::intgemm16avx512> > (bias, inputB_preppd, transB);
       default:
         ABORT("Unsupported type {} for Intgemm type??", intgemmType);
     }
   }
 }
 
-static Expr PrepareFakeBiasForBTyped(Expr inputB_preppd, Expr inputA_preppd=nullptr) {
+static Expr PrepareFakeBiasForBTyped(Expr inputB_preppd, Expr inputA_preppd=nullptr, bool transB=false) {
   static const Type intgemmType = inputB_preppd->value_type();
   if (inputA_preppd) {
     switch(intgemmType) {
       case Type::intgemm8ssse3 :
-        return Expression<PrepareFakeBiasForBNodeOp<Type::intgemm8ssse3> >(inputB_preppd, inputA_preppd);
+        return Expression<PrepareFakeBiasForBNodeOp<Type::intgemm8ssse3> >(inputB_preppd, inputA_preppd, transB);
       case Type::intgemm8avx2 :
-        return Expression<PrepareFakeBiasForBNodeOp<Type::intgemm8avx2> > (inputB_preppd, inputA_preppd);
+        return Expression<PrepareFakeBiasForBNodeOp<Type::intgemm8avx2> > (inputB_preppd, inputA_preppd, transB);
       case Type::intgemm8avx512 :
-        return Expression<PrepareFakeBiasForBNodeOp<Type::intgemm8avx512> >(inputB_preppd, inputA_preppd);
+        return Expression<PrepareFakeBiasForBNodeOp<Type::intgemm8avx512> >(inputB_preppd, inputA_preppd, transB);
       case Type::intgemm8avx512vnni :
-        return Expression<PrepareFakeBiasForBNodeOp<Type::intgemm8avx512vnni> > (inputB_preppd, inputA_preppd);
+        return Expression<PrepareFakeBiasForBNodeOp<Type::intgemm8avx512vnni> > (inputB_preppd, inputA_preppd, transB);
       case Type::intgemm16sse2 :
-        return Expression<PrepareFakeBiasForBNodeOp<Type::intgemm16sse2> >(inputB_preppd, inputA_preppd);
+        return Expression<PrepareFakeBiasForBNodeOp<Type::intgemm16sse2> >(inputB_preppd, inputA_preppd, transB);
       case Type::intgemm16avx2 :
-        return Expression<PrepareFakeBiasForBNodeOp<Type::intgemm16avx2> > (inputB_preppd, inputA_preppd);
+        return Expression<PrepareFakeBiasForBNodeOp<Type::intgemm16avx2> > (inputB_preppd, inputA_preppd, transB);
       case Type::intgemm16avx512 :
-        return Expression<PrepareFakeBiasForBNodeOp<Type::intgemm16avx512> > (inputB_preppd, inputA_preppd);
+        return Expression<PrepareFakeBiasForBNodeOp<Type::intgemm16avx512> > (inputB_preppd, inputA_preppd, transB);
       default:
         ABORT("Unsupported type {} for Intgemm type??", intgemmType);
     }
   } else {
     switch(intgemmType) {
       case Type::intgemm8ssse3 :
-        return Expression<PrepareFakeBiasForBNodeOp<Type::intgemm8ssse3> >(inputB_preppd);
+        return Expression<PrepareFakeBiasForBNodeOp<Type::intgemm8ssse3> >(inputB_preppd, transB);
       case Type::intgemm8avx2 :
-        return Expression<PrepareFakeBiasForBNodeOp<Type::intgemm8avx2> > (inputB_preppd);
+        return Expression<PrepareFakeBiasForBNodeOp<Type::intgemm8avx2> > (inputB_preppd, transB);
       case Type::intgemm8avx512 :
-        return Expression<PrepareFakeBiasForBNodeOp<Type::intgemm8avx512> >(inputB_preppd);
+        return Expression<PrepareFakeBiasForBNodeOp<Type::intgemm8avx512> >(inputB_preppd, transB);
       case Type::intgemm8avx512vnni :
-        return Expression<PrepareFakeBiasForBNodeOp<Type::intgemm8avx512vnni> > (inputB_preppd);
+        return Expression<PrepareFakeBiasForBNodeOp<Type::intgemm8avx512vnni> > (inputB_preppd, transB);
       case Type::intgemm16sse2 :
-        return Expression<PrepareFakeBiasForBNodeOp<Type::intgemm16sse2> >(inputB_preppd);
+        return Expression<PrepareFakeBiasForBNodeOp<Type::intgemm16sse2> >(inputB_preppd, transB);
       case Type::intgemm16avx2 :
-        return Expression<PrepareFakeBiasForBNodeOp<Type::intgemm16avx2> > (inputB_preppd);
+        return Expression<PrepareFakeBiasForBNodeOp<Type::intgemm16avx2> > (inputB_preppd, transB);
       case Type::intgemm16avx512 :
-        return Expression<PrepareFakeBiasForBNodeOp<Type::intgemm16avx512> > (inputB_preppd);
+        return Expression<PrepareFakeBiasForBNodeOp<Type::intgemm16avx512> > (inputB_preppd, transB);
       default:
         ABORT("Unsupported type {} for Intgemm type??", intgemmType);
     }
   }
 }
 
-static Expr PrepareBiasForBTyped(Expr bias, Expr inputB_preppd, Expr inputA_preppd=nullptr) {
+static Expr PrepareBiasForBTyped(Expr bias, Expr inputB_preppd, Expr inputA_preppd=nullptr, bool transB=false) {
   static bool precomputedAlpha = inputB_preppd->graph()->getBackend()->isPrecomputedAlpha(); // Detect if we have precomputed alphas or not
   if (precomputedAlpha) {
     inputA_preppd = nullptr; // When we have precomputed alphas we fetch the aQuantMult from B
@@ -581,9 +600,9 @@ static Expr PrepareBiasForBTyped(Expr bias, Expr inputB_preppd, Expr inputA_prep
   if (precomputedAlpha && bias && bias->type() == "cols") {
     return bias; // When we have precomputed alphas the shortlisted bias has already been prepared
   } else if (bias) {
-    return PrepareTrueBiasForBTyped(bias, inputB_preppd, inputA_preppd);
+    return PrepareTrueBiasForBTyped(bias, inputB_preppd, inputA_preppd, transB);
   } else {
-    return PrepareFakeBiasForBTyped(inputB_preppd, inputA_preppd);
+    return PrepareFakeBiasForBTyped(inputB_preppd, inputA_preppd, transB);
   }
 }
 

@@ -102,6 +102,14 @@ Logits Output::applyAsLogits(Expr input) /*override final*/ {
           cachedShortWt_ = cpu::integer::SelectColumnsBTyped(cachedShortWt_, shortlist_->indices());
         }
       } else { // oneDNN should also take this codepath
+        if (useOneDNN) { // Horrible horrible spaghetti needs refactoring
+          //transpose(Wt_); // tmp hack
+          //transposed = isLegacyUntransposedW; // tmp hack
+          cachedShortWt_ = cpu::integer::prepareBTyped(Wt_, transposed /*Use different routine as Wt is transposed*/);
+        }
+        if (useOneDNN && graph_->getBackend()->isShifted() && hasBias_) {
+          preparedBias = cpu::integer::PrepareBiasForBTyped(b_, cachedShortWt_, nullptr, transposed);
+        }
         cachedShortWt_ = index_select(Wt_, isLegacyUntransposedW ? -1 : 0, shortlist_->indices());
       }
     } else {
