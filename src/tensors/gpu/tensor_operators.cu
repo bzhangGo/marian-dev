@@ -1665,11 +1665,6 @@ __global__ void gCrossEntropyPick(AccType* out,
         if(id == (int)pick[j]) {
           AccType logsumexp = functional::Ops<AccType>::log(sumexp);
           AccType ce = logsumexp - (AccType)sp[id] + (AccType)max; // cross-entropy    H(y^, p)
-
-
-          // a stupid hack, beware kids
-          ce = functional::Ops<AccType>::exp(ce); 
-
           AccType ls = logsumexp - mean;                           // label smoothing  H(u, p)
           out[j] = (1.f - labelSmoothingAlpha) * ce + labelSmoothingAlpha * ls;  // (1 - alpha) * H(y^, p) + alpha * H(u, p)
         }
@@ -1776,9 +1771,6 @@ __global__ void gCrossEntropyPickBackward(T* out,
         if(id < cols) {
           AccType sub = (AccType)(id == (int)pick[j]);
           AccType dce = functional::Ops<AccType>::exp(sp[id] - max) / _sum[0] - sub;
-
-          dce = -(1 / dce);
-
           AccType dls = labelSmoothingAlpha * (sub - 1.f / (AccType)cols);
           so[id] += (T)(adj[j] * (dce + dls));
         }

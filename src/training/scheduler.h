@@ -140,6 +140,9 @@ private:
   }
 
 public:
+
+  std::map<std::string, float> regScalars_;
+  
   Scheduler(Ptr<Options> options, Ptr<TrainingState> state, Ptr<IMPIWrapper> mpi = nullptr)
       : options_(options),
         state_(state),
@@ -512,11 +515,12 @@ public:
       if (options_->get<std::string>("multi-loss-type") == "sum") { 
         for(auto& kv : state_->partialCostSum) {
           LOG(info,
-              "Ep. {} : Up. {} : Name {} : Penalty : {:.4f} : Count {} : Cost {}",
+              "Ep. {} : Up. {} : Name {} : Penalty : {:.4f} : Scalar {:.4f} : Count {} : Cost {}",
               formatLogicalEpoch(),
               state_->batches,
               kv.first,
               kv.second,
+              regScalars_[kv.first],
               state_->costCount,
               kv.second / state_->costCount);
 

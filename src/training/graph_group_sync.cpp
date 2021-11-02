@@ -412,7 +412,9 @@ void SyncGraphGroup::update(std::vector<Ptr<data::Batch>> subBatches, size_t num
 
 void SyncGraphGroup::updateRegularisationStatistics(float gradNorm) {
   // perform everything on GPU/model 0
- 
+
+  std::map<std::string, float> globalScalars; // gather all scalars in one place to print later
+
   // LOG(info, "updateRegularisationStatistics()");
   auto model = std::dynamic_pointer_cast<EncoderDecoder>(models_[0]->getModel());
   if (!model) // if it's not enc dec model, then just ignore
@@ -430,6 +432,7 @@ void SyncGraphGroup::updateRegularisationStatistics(float gradNorm) {
       
       // update stats
       auto scalars = regularisers[j]->updateStats(graphs_[0], gradNorm);
+      globalScalars.insert(scalars.begin(), scalars.end());
 
       // copy the new statistics across other models and graphs
       for (int i = 1; i < models_.size(); i++) {
@@ -449,6 +452,7 @@ void SyncGraphGroup::updateRegularisationStatistics(float gradNorm) {
       
       // update stats
       auto scalars = regularisers[j]->updateStats(graphs_[0], gradNorm);
+      globalScalars.insert(scalars.begin(), scalars.end());
 
       // copy the new statistics across other models and graphs
       for (int i = 1; i < models_.size(); i++) {
@@ -458,6 +462,8 @@ void SyncGraphGroup::updateRegularisationStatistics(float gradNorm) {
       }
     }
   }
+
+  scheduler_->regScalars_ = globalScalars;
   
 }
 
