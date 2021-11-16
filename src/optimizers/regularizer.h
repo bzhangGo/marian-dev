@@ -24,7 +24,8 @@ protected:
   float lambda_{0.0f};
   std::string type_{""};
 
-  std::map<std::string, Expr> partialPenalties_;
+  std::map<std::string, Expr> partialPenalties_; // to gather penalties for all layers
+  std::map<std::string, Expr> masks_; // additional binary masks if needed somewhere
 
 public:
   IRegulariser(Ptr<ExpressionGraph> graph, Ptr<Options> options, float lambda, std::string type)
@@ -400,7 +401,13 @@ protected:
       axisL1 = -2;
     }
 
-    auto WSum = sum(W * W, axisL2);
+    // calculate mask, used in aided regulariser
+    
+    auto WMask = gt(sum(W, axisL2), 1e-5);
+    masks_.emplace(W->name(), WMask);
+    //
+
+    auto WSum = sum(W * W, axisL2) * WMask;
 
     // if regularising columns, we also need to remove biases with L2
     if(!rows) {
