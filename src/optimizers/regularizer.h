@@ -26,6 +26,7 @@ protected:
 
   std::map<std::string, Expr> partialPenalties_; // to gather penalties for all layers
   std::map<std::string, Expr> masks_; // additional binary masks if needed somewhere
+  std::map<std::string, Expr> sparsities_; // additional sparsity info on each layer
 
 public:
   IRegulariser(Ptr<ExpressionGraph> graph, Ptr<Options> options, float lambda, std::string type)
@@ -56,7 +57,11 @@ public:
 
   virtual std::map<std::string, Expr> getPartialPenalties() { return partialPenalties_; }
 
-  virtual void clear() { partialPenalties_.clear(); }
+  virtual void clear() { 
+    partialPenalties_.clear(); 
+    masks_.clear();
+    sparsities_.clear();
+  }
 
   // virtual Expr getMask( return nullptr; )
 
@@ -403,11 +408,28 @@ protected:
 
     // calculate mask, used in aided regulariser
     
-    auto WMask = gt(sum(W, axisL2), 1e-5);
+    // auto WMask = gt(sum(abs(W), axisL2), 1e-5);
+    auto WMask = gt(sum(abs(W), axisL2), 1e-5);
+    // debug(WMask, W->name() + " mask");
     masks_.emplace(W->name(), WMask);
+    Expr WSparsity;
+    if(!rows)
+      WSparsity = (1 + sum(WMask, axisL1)) / W->shape()[1];
+    else
+      WSparsity = (1 + sum(WMask, axisL1)) / W->shape()[0];
+    sparsities_.emplace(W->name(), WSparsity);
+    // debug(WSparsity, W->name() + " sparsity");
+
+    WMask->setTrainable(false);
+    WSparsity->setTrainable(false);
+
+    // stopGradient(WMask);
+    // stopGradient(WSparsity);
+    auto WOne = WSparsity / WSparsity; // stupid trick to connect to a graph
+    // debug(WOne, "WOne, powinno byc 1");
     //
 
-    auto WSum = sum(W * W, axisL2) * WMask;
+    auto WSum = sum(W * W, axisL2) * WOne;
 
     // if regularising columns, we also need to remove biases with L2
     if(!rows) {
@@ -471,7 +493,7 @@ protected:
 
 public:
   AidedGroupLassoRegulariser(Ptr<ExpressionGraph> graph, Ptr<Options> options, float lambda, std::string type)
-      : IRegulariser(graph, options, lambda, type) { LOG(info, "AidedGroupLasso constructor");}
+      : IRegulariser(graph, options, lambda, type) { }
 
   using IAidedRegulariser::synchroStats;
   using IAidedRegulariser::updateStats;
@@ -479,6 +501,18 @@ public:
   virtual ~AidedGroupLassoRegulariser() {}
   
   std::map<std::string, float> updateStats(Ptr<ExpressionGraph> graph, float gradNorm) override {
+    // LOG(info, "Type = {}", type_);
+    if(type_ == "gradient-aided")
+      updateStatsWithGradients(graph, gradNorm);
+    else if (type_ == "sparsity-gradient")
+      updateStatsWithSparsity(graph);
+    else // default to gradients
+      updateStatsWithSparsity(graph);
+    
+    return scalars_;
+  }
+
+  void updateStatsWithGradients(Ptr<ExpressionGraph> graph, float gradNorm) {
 
     // LOG(info, "AidedGroupLasso UPDATE STAAAAAATS");
 
@@ -531,7 +565,51 @@ public:
       // LOG(info, "updatedStats, global gradNorm={}, node={}, gradScalar={}, sqrtScalar={}, scalar={} flipped={} dim={}", gradNorm, name, newScalar, sqrtScalar, scalars_[name], flipped_[name], dim); 
     }
 
-    return scalars_;
+  }
+  
+  void updateStatsWithSparsity(Ptr<ExpressionGraph> graph, float gradNorm = 0.0f) {
+
+    // LOG(info, "Sparsity AidedGroupLasso UPDATE STAAAAAATS");
+
+    if(!graph_) {
+      LOG(info, "WHY IS GRAPH POINTER EMPTY HERE IN updateStats???");
+      graph_ = graph;
+    }
+
+
+    for (const auto &s : scalars_) { // for all layers that we regularise
+      auto name = s.first;
+      auto node = graph_->get(name);
+      auto mask = masks_[name];
+
+      if (!node)
+        LOG(info, "node of the name {} is nullptr???", name);
+      if (!mask)
+        LOG(info, "mask of the name {} is nullptr???", name);
+
+      // Average the abs of gradients for the layer
+      
+      // float dim = node->shape()[1];
+      // if (flipped_[name])
+        // dim = node->shape()[0];
+      float sparsity = sparsities_[name]->val()->get(0); 
+      // float newScalar = std::exp(1.0f - sparsity); // linear 
+      // float newScalar = 1.0f + (std::exp(1 - sparsity));
+      float newScalar = (std::exp(1 - sparsity));
+
+      // float newScalar = 1.0f;
+
+      if (scalars_[name] == 0.0f) { // if no previous statistics were done
+        // LOG(info, "ZEROOOOOO");
+        scalars_[name] = newScalar; 
+      }
+      else { // do exponential moving average if previous statistic exist
+        scalars_[name] = alpha_ * newScalar + (1 - alpha_) * scalars_[name]; 
+      }
+
+      // LOG(info, "updatedStats, global gradNorm={}, node={}, sparsity={}, scalar={} flipped={} dim={}", gradNorm, name, sparsity, newScalar, scalars_[name], flipped_[name], dim); 
+    }
+
   }
   
   Expr calculatePenalty(Expr W, Expr b, bool rows = false, bool inference = false) override {
@@ -610,8 +688,11 @@ public:
     } else if(type == "heads") {
       LOG_ONCE(info, "Regularisation type selected: group lasso, shape=heads");
       return New<GroupLassoRegulariser>(graph, options_, lambda, type);
-    } else if(type == "aided") {
-      LOG_ONCE(info, "Regularisation type selected: aided group lasso, shape=rowcol");
+    } else if(type == "gradient-aided") {
+      LOG_ONCE(info, "Regularisation type selected: gradient-aided group lasso, shape=rowcol");
+      return New<AidedGroupLassoRegulariser>(graph, options_, lambda, type);
+    } else if(type == "sparsity-aided") {
+      LOG_ONCE(info, "Regularisation type selected: sparsity-aided group lasso, shape=rowcol");
       return New<AidedGroupLassoRegulariser>(graph, options_, lambda, type);
     } else {
       LOG_ONCE(

@@ -428,7 +428,7 @@ void SyncGraphGroup::updateRegularisationStatistics(float gradNorm) {
   // LOG(info, "regularisers size enc {}", regularisers.size());
   for (int j = 0; j < regularisers.size(); j++) {
     // LOG(info, "reg type {}", regularisers[j]->getType());
-    if (regularisers[j]->getType() == "aided") {
+    if (regularisers[j]->getType().find("aided") != std::string::npos) {
       
       // update stats
       auto scalars = regularisers[j]->updateStats(graphs_[0], gradNorm);
@@ -448,7 +448,7 @@ void SyncGraphGroup::updateRegularisationStatistics(float gradNorm) {
 
   regularisers = dec->getRegularisers();
   for (int j = 0; j < regularisers.size(); j++) {
-    if (regularisers[j]->getType() == "aided") {
+    if (regularisers[j]->getType().find("aided") != std::string::npos) {
       
       // update stats
       auto scalars = regularisers[j]->updateStats(graphs_[0], gradNorm);
