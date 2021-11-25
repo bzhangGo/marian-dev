@@ -406,30 +406,31 @@ protected:
       axisL1 = -2;
     }
 
-    // calculate mask, used in aided regulariser
+    // USED FOR SPARSITY-AIDED REMOVED FOR NOW
+    // // calculate mask, used in aided regulariser
     
+    // // auto WMask = gt(sum(abs(W), axisL2), 1e-5);
     // auto WMask = gt(sum(abs(W), axisL2), 1e-5);
-    auto WMask = gt(sum(abs(W), axisL2), 1e-5);
-    // debug(WMask, W->name() + " mask");
-    masks_.emplace(W->name(), WMask);
-    Expr WSparsity;
-    if(!rows)
-      WSparsity = (1 + sum(WMask, axisL1)) / W->shape()[1];
-    else
-      WSparsity = (1 + sum(WMask, axisL1)) / W->shape()[0];
-    sparsities_.emplace(W->name(), WSparsity);
-    // debug(WSparsity, W->name() + " sparsity");
+    // // debug(WMask, W->name() + " mask");
+    // masks_.emplace(W->name(), WMask);
+    // Expr WSparsity;
+    // if(!rows)
+      // WSparsity = (1 + sum(WMask, axisL1)) / W->shape()[1];
+    // else
+      // WSparsity = (1 + sum(WMask, axisL1)) / W->shape()[0];
+    // sparsities_.emplace(W->name(), WSparsity);
+    // // debug(WSparsity, W->name() + " sparsity");
 
-    WMask->setTrainable(false);
-    WSparsity->setTrainable(false);
+    // WMask->setTrainable(false);
+    // WSparsity->setTrainable(false);
 
-    // stopGradient(WMask);
-    // stopGradient(WSparsity);
-    auto WOne = WSparsity / WSparsity; // stupid trick to connect to a graph
-    // debug(WOne, "WOne, powinno byc 1");
-    //
+    // // stopGradient(WMask);
+    // // stopGradient(WSparsity);
+    // auto WOne = WSparsity / WSparsity; // stupid trick to connect to a graph
+    // // debug(WOne, "WOne, powinno byc 1");
+    // //
 
-    auto WSum = sum(W * W, axisL2) * WOne;
+    auto WSum = sum(W * W, axisL2);
 
     // if regularising columns, we also need to remove biases with L2
     if(!rows) {
@@ -504,10 +505,12 @@ public:
     // LOG(info, "Type = {}", type_);
     if(type_ == "gradient-aided")
       updateStatsWithGradients(graph, gradNorm);
+    else if (type_ == "param-gradient")
+      updateStatsWithParams(graph);
     else if (type_ == "sparsity-gradient")
       updateStatsWithSparsity(graph);
     else // default to gradients
-      updateStatsWithSparsity(graph);
+      updateStatsWithParams(graph);
     
     return scalars_;
   }
@@ -550,6 +553,59 @@ public:
       // float newScalar = std::sqrt(tempAvg_->get(0)) * (1.0f / dim);
       float sqrtScalar = std::sqrt(tempAvg_->get(0));
       float newScalar = std::abs(std::log(sqrtScalar / gradNorm));
+      tempAvg_->set(0);
+
+      // float newScalar = 1.0f;
+
+      if (scalars_[name] == 0.0f) { // if no previous statistics were done
+        // LOG(info, "ZEROOOOOO");
+        scalars_[name] = newScalar; 
+      }
+      else { // do exponential moving average if previous statistic exist
+        scalars_[name] = alpha_ * newScalar + (1 - alpha_) * scalars_[name]; 
+      }
+
+      // LOG(info, "updatedStats, global gradNorm={}, node={}, gradScalar={}, sqrtScalar={}, scalar={} flipped={} dim={}", gradNorm, name, newScalar, sqrtScalar, scalars_[name], flipped_[name], dim); 
+    }
+
+  }
+  void updateStatsWithParams(Ptr<ExpressionGraph> graph, float gradNorm = 0.0f) {
+
+    // LOG(info, "AidedGroupLasso UPDATE STAAAAAATS");
+
+    if(!graph_) {
+      LOG(info, "WHY IS GRAPH POINTER EMPTY HERE IN updateStats???");
+      graph_ = graph;
+    }
+
+    if (!tempAvg_) {
+        auto allocator = New<TensorAllocator>(graph_->getBackend());
+        allocator->reserveExact(graph_->params()->vals()->memory()->size());
+        allocator->allocate(tempAvg_, {1, 1});
+
+        // tempAvg_->set(0);
+
+        allocators_.push_back(allocator);
+    }
+
+    for (const auto &s : scalars_) { // for all layers that we regularise
+      auto name = s.first;
+      auto node = graph_->get(name);
+
+      if (!node)
+        LOG(info, "node of the name {} is nullptr???", name);
+
+      // Average the abs of gradients for the layer
+      
+      float dim = node->shape()[1];
+      if (flipped_[name])
+        dim = node->shape()[0];
+
+      using namespace functional;
+      Reduce(_1 * _1, 1.0f, tempAvg_, node->val());
+      // float newScalar = std::sqrt(tempAvg_->get(0)) * (1.0f / dim);
+      float sqrtScalar = std::sqrt(tempAvg_->get(0));
+      float newScalar = std::abs(std::log(sqrtScalar / dim));
       tempAvg_->set(0);
 
       // float newScalar = 1.0f;
@@ -690,6 +746,9 @@ public:
       return New<GroupLassoRegulariser>(graph, options_, lambda, type);
     } else if(type == "gradient-aided") {
       LOG_ONCE(info, "Regularisation type selected: gradient-aided group lasso, shape=rowcol");
+      return New<AidedGroupLassoRegulariser>(graph, options_, lambda, type);
+    } else if(type == "param-aided") {
+      LOG_ONCE(info, "Regularisation type selected: sparsity-aided group lasso, shape=rowcol");
       return New<AidedGroupLassoRegulariser>(graph, options_, lambda, type);
     } else if(type == "sparsity-aided") {
       LOG_ONCE(info, "Regularisation type selected: sparsity-aided group lasso, shape=rowcol");
