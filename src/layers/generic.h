@@ -215,6 +215,7 @@ static inline Expr denseInline(Expr x,
       }
       else if (!inference) {
         auto penalty = r->calculatePenalty(W, b, rows);
+        penalty = penalty + 1e-6;
         // debug(penalty);
         W = W * (penalty / penalty); // stupid trick to connect to a graph?
       } 

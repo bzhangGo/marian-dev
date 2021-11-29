@@ -377,6 +377,8 @@ public:
         else if (!inference_) {
           auto penalty = r->calculatePenalty(W, b, rows);
           // debug(penalty);
+          // to avoid dividing by zero
+          penalty = penalty + 1e-6;
           W = W * (penalty / penalty); // stupid trick to connect to a graph?
           return std::make_tuple(W, b);
         } 
