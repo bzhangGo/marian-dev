@@ -399,12 +399,15 @@ public:
                  bool saveAttentionWeights = false) {
     int dimModel = q->shape()[-1];
 
+    bool pruneEncOrDec = false;
     bool pruneAtt = false;
     bool skipRowcol = false;
 
     if (!inference_) {
       auto pruneFlags = opt<std::string>("regulariser-flags"); // flags = edfh enc dec ffn heads
-      pruneAtt = (pruneFlags.find("h") != std::string::npos); // prune if heads activated
+      pruneEncOrDec = (prefix.find("encoder") != std::string::npos && pruneFlags.find("e") != std::string::npos) || 
+                      (prefix.find("decoder") != std::string::npos && pruneFlags.find("d") != std::string::npos);
+      pruneAtt = (pruneFlags.find("h") != std::string::npos && pruneEncOrDec); // prune if heads activated and this network is activated for regularisation
 
       auto regTypes = opt<std::vector<std::string>>("regulariser-type");
       // if rowcol and heads activated at the same time, just don't do rowcol on attention and heads on ffn
@@ -578,9 +581,12 @@ public:
     auto initFn = inits::glorotUniform(true, true, depthScaling_ ? 1.f / sqrtf((float)depth_) : 1.f);
 
     bool pruneFFN = false;
+    bool pruneEncOrDec = false;
     if (!inference_) {
       auto pruneFlags = opt<std::string>("regulariser-flags"); // flags = edfh enc dec ffn heads
-      pruneFFN = (pruneFlags.find("f") != std::string::npos) && !inference_; // prune if ffn activated
+      pruneEncOrDec = (prefix.find("encoder") != std::string::npos && pruneFlags.find("e") != std::string::npos) || 
+                      (prefix.find("decoder") != std::string::npos && pruneFlags.find("d") != std::string::npos);
+      pruneFFN = (pruneFlags.find("f") != std::string::npos) && pruneEncOrDec && !inference_; // prune if ffn activated
     }
     
     // the stack of FF layers
