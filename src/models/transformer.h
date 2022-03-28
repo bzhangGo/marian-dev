@@ -555,11 +555,7 @@ public:
 
   Expr LayerFFN(std::string prefix, Expr input, int layerNum = 0) const {
     int dimModel = input->shape()[-1];
-
-    float dropProb = inference_ ? 0 : opt<float>("transformer-dropout");
-    auto opsPre = opt<std::string>("transformer-preprocess");
-    auto output = preProcess(prefix + "_ffn", opsPre, input, dropProb);
-
+    
     int dimFfn;
     if (prefix.find("encoder") != std::string::npos) {
       dimFfn = opt<std::vector<int>>("transformer-enc-ffn-dim")[layerNum - 1];
@@ -570,6 +566,18 @@ public:
     else {
       dimFfn = opt<int>("transformer-dim-ffn"); // won't enter it but just in case, change to use it as default later
     }
+  
+    // LOG(info, "layer = {} dimFfn = {}", prefix, dimFfn);
+    if (dimFfn == 0) { // skip layer entirely
+      // LOG(info, "IT IS ZERO! RETURN...");
+      return input;
+    }
+    // LOG(info, "IS NOT ZERO! CONTINUE WITH THE LAYER");
+
+    float dropProb = inference_ ? 0 : opt<float>("transformer-dropout");
+    auto opsPre = opt<std::string>("transformer-preprocess");
+    auto output = preProcess(prefix + "_ffn", opsPre, input, dropProb);
+
 
     auto actName = opt<std::string>("transformer-ffn-activation");
     int depthFfn = opt<int>("transformer-ffn-depth");
