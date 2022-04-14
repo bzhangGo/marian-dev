@@ -1,10 +1,15 @@
 #pragma once
 
+#include <cmath>
+#include <unordered_map>
+#include "common/definitions.h"
 #include "graph/node.h"
 #include "graph/node_operators_unary.h"
 #include "integer_common.h"
 
 #include "oneapi/dnnl/dnnl.hpp"
+
+static bool USE_NEW_PATH = std::getenv("USE_NEW_PATH") != nullptr;
 
 static inline void printDNNLStatus(dnnl::status& status) {
   if (status == dnnl::status::success) {
@@ -30,25 +35,75 @@ using dt = dnnl::memory::data_type;
 
 static dnnl::engine eng = dnnl::engine(dnnl::engine::kind::cpu, 0);
 
-inline matmul::primitive_desc make_matmul_primitive(bool shifted, bool transB) {
+// I should use an enum for this but C++ and enum flags.. nope.
+struct matmul_variant {
+  bool shifted;
+  bool transB;
+  bool bias;
+  bool relu;
+
+  friend bool operator==(matmul_variant const &a, matmul_variant const &b) {
+    return std::memcmp(&a, &b, sizeof(matmul_variant)) == 0;
+  }
+
+  friend std::ostream &operator<<(std::ostream &out, matmul_variant const &variant) {
+    return out << "[matmul_variant"
+      << (variant.shifted ? " shifted" : "")
+      << (variant.transB  ? " trans-b" : "")
+      << (variant.bias    ? " bias"    : "")
+      << (variant.relu    ? " relu"    : "")
+      << "]";
+  }
+};
+
+// I need something to be able to use matmul_variant as a map key.
+template <>
+struct std::hash<matmul_variant> {
+  std::size_t operator()(const matmul_variant &variant) const {
+    return (variant.shifted ? 1 << 0 : 0)
+         | (variant.transB  ? 1 << 1 : 0)
+         | (variant.bias    ? 1 << 2 : 0)
+         | (variant.relu    ? 1 << 3 : 0);
+  }
+};
+
+inline matmul::primitive_desc make_matmul_primitive(matmul_variant variant) {
   dims a_dims_strides{DNNL_RUNTIME_DIM_VAL, 1};
-  dims b_dims_strides = transB ? dims {1, DNNL_RUNTIME_DIM_VAL} : dims {DNNL_RUNTIME_DIM_VAL, 1};
+  dims b_dims_strides = variant.transB ? dims {1, DNNL_RUNTIME_DIM_VAL} : dims {DNNL_RUNTIME_DIM_VAL, 1};
   
   dims c_dims_strides = {DNNL_RUNTIME_DIM_VAL, 1};
   dims rt_rt_dims = {DNNL_RUNTIME_DIM_VAL, DNNL_RUNTIME_DIM_VAL};
   dims rt_1_dims = {DNNL_RUNTIME_DIM_VAL, DNNL_RUNTIME_DIM_VAL};
   
-  dnnl::memory::desc a_md(rt_rt_dims, shifted ? dt::u8 : dt::s8,  a_dims_strides);
+  dnnl::memory::desc a_md(rt_rt_dims, variant.shifted ? dt::u8 : dt::s8,  a_dims_strides);
   dnnl::memory::desc b_md(rt_rt_dims, dt::s8,  b_dims_strides);
-  dnnl::memory::desc c_md(rt_rt_dims, dt::s32, c_dims_strides);
+  dnnl::memory::desc c_md(rt_rt_dims, USE_NEW_PATH ? dt::f32 : dt::s32, c_dims_strides);
   
   dnnl::primitive_attr attr;
   attr.set_output_scales(/* mask */ 0, {DNNL_RUNTIME_F32_VAL});
   
+  if (USE_NEW_PATH && variant.bias) {
+    attr.set_zero_points(DNNL_ARG_DST, /* mask */ 2, {DNNL_RUNTIME_S32_VAL});
+  }
+
+  if (USE_NEW_PATH && variant.relu) {
+    dnnl::post_ops ops;
+    ops.append_eltwise(1.0, dnnl::algorithm::eltwise_relu, 0.f, 0.f);
+    attr.set_post_ops(ops);
+  }
+
   matmul::desc matmul_d(a_md, b_md, c_md);
   matmul::primitive_desc matmul_pd(matmul_d, attr, eng, true);
 
   return matmul_pd;
+}
+
+template <typename src_t, typename dst_t>
+static void todo_convert_bias(marian::Tensor &bias, float factor) {
+  src_t *in = bias->data<src_t>();
+  dst_t *out = bias->data<dst_t>();
+  for (size_t i = 0; i < bias->size(); ++i)
+    out[i] = factor * in[i];
 }
 
 namespace marian {
@@ -340,7 +395,7 @@ public:
         intgemm::Int8Shift::PrepareBias((const int8_t *)b->data(), rows(b), cols(b), intgemm::callbacks::UnquantizeAndAddBiasAndWrite(unquant_mult, bias->data(), val_->data()));
       } else {
         static const std::vector<uint8_t> ones(64000, 1); // Large enough static array of ones that we can use
-        static matmul::primitive_desc matmul_u8s8s32 = make_matmul_primitive(true, false);
+        static matmul::primitive_desc matmul_u8s8s32 = make_matmul_primitive({true, false, false, false});
 
         dnnl::matmul matmul_p = matmul(matmul_u8s8s32);
 
@@ -434,7 +489,7 @@ public:
     } else {
       static const std::vector<uint8_t> ones(64000, 1); // Large enough static array of ones that we can use
 
-      static matmul::primitive_desc matmul_u8s8s32 = make_matmul_primitive(true, false);
+      static matmul::primitive_desc matmul_u8s8s32 = make_matmul_primitive({true, false, false, false});
 
       dnnl::matmul matmul_p = matmul(matmul_u8s8s32);
 
@@ -682,14 +737,17 @@ static inline Expr affineOrDotTyped(Expr a, Expr bQuant, Expr bias, bool transA,
 
     // std::cerr << "dnnlDotOrAffineNodeOp" << (shifted ? " shifted" : "") << (transB ? " transB" : "") << std::endl;
 
-    static std::array<matmul::primitive_desc, 4> matmul_x8s8s32 = {
-      make_matmul_primitive(false, false),
-      make_matmul_primitive(false, true),
-      make_matmul_primitive(true, false),
-      make_matmul_primitive(true, true),
-    };
+    // Describe a variant of the matmul primitive we'll need. Does it need to add bias? relu? etc.
+    const matmul_variant variant{shifted, transB, bias ? true : false, relu};
 
-    dnnl::matmul matmul_p = matmul(matmul_x8s8s32[2*shifted + transB]);
+    // Here we have our wee cache of matmul primitive descriptors for each variant
+    thread_local static std::unordered_map<matmul_variant, matmul::primitive_desc> matmul_x8s8s32;
+    auto matmul_p_it = matmul_x8s8s32.find(variant);
+    if (matmul_p_it == matmul_x8s8s32.end())
+      std::tie(matmul_p_it, std::ignore) = matmul_x8s8s32.emplace(std::make_pair(variant, make_matmul_primitive(variant)));
+    
+    // Construct the primitive itself
+    dnnl::matmul matmul_p = matmul(matmul_p_it->second);
 
     dnnl::memory A_m({
         /* size   */ {rows(aQuant->val()), cols(aQuant->val())},
@@ -713,26 +771,43 @@ static inline Expr affineOrDotTyped(Expr a, Expr bQuant, Expr bias, bool transA,
                },
       eng,
       (void *) bQuant->val()->data<int8_t>());
-    
+
     dnnl::memory C_m({
       /* size   */ {rows(out->val()), cols(out->val())},
-      /* type   */ dt::s32,
+      /* type   */ USE_NEW_PATH ? dt::f32 : dt::s32,
       /* stride */ {cols(out->val()), 1}
       },
       eng,
-      (void *) out->val()->data<int32_t>());
+      USE_NEW_PATH ? (void *) out->val()->data<float>() : (void *) out->val()->data<int32_t>());
 
-    // Prepare oneDNN memory for alpha
-    float alpha = 1.0f;
-    dnnl::memory alpha_m({{1}, dt::f32, {1}}, eng, &alpha);
-
-    dnnl::stream s(eng);
-    matmul_p.execute(s, {
+    float alphas = 1.f;
+    dnnl::memory alpha_m({{1}, dt::f32, {1}}, eng, USE_NEW_PATH ? &unquant_mult : &alphas);
+    
+    std::unordered_map<int, dnnl::memory> args{
       {DNNL_ARG_SRC, A_m},
       {DNNL_ARG_WEIGHTS, B_m},
       {DNNL_ARG_DST, C_m},
       {DNNL_ARG_ATTR_OUTPUT_SCALES, alpha_m}
-    });
+    };
+
+    if (USE_NEW_PATH && bias) {
+      // Wait what?! Yes, OneDNN has a slightly different view of what quantisation entails:
+      // https://oneapi-src.github.io/oneDNN/dev_guide_attributes_quantization.html
+      todo_convert_bias<float,int32_t>(bias->val(), -1.f * unquant_mult);
+
+      dnnl::memory bias_m({
+        /* size   */ {rows(bias->val()), cols(bias->val())},
+        /* type   */ dt::f32,
+        /* stride */ {cols(bias->val()), 1}
+        },
+        eng,
+        (void *) bias->val()->data<float>());
+
+      args[DNNL_ARG_ATTR_ZERO_POINTS | DNNL_ARG_DST] = bias_m;
+    }
+
+    dnnl::stream s(eng);
+    matmul_p.execute(s, args);
     s.wait();
     
     // TODO: How to get status?
@@ -743,6 +818,7 @@ static inline Expr affineOrDotTyped(Expr a, Expr bQuant, Expr bias, bool transA,
     // }
 
     //Unquantise and add bias if necessary
+    if (!USE_NEW_PATH) {
     if (bias && relu) {
       UnquantiseAndAddBiasAndRelu(out->val(), bias->val(), unquant_mult);
     } else if (bias) {
@@ -752,6 +828,12 @@ static inline Expr affineOrDotTyped(Expr a, Expr bQuant, Expr bias, bool transA,
     } else {
       JustUnquantise(out->val(), unquant_mult);
     }
+    } // USE_NEW_PATH
+
+    if (USE_NEW_PATH && bias)
+      todo_convert_bias<int32_t,float>(bias->val(), -1.f / unquant_mult);
+
+    std::cerr << "Scale: " << scale << " Variant: " << variant << "\n" << out->val()->debug() << std::endl;
   };
 
   // wrap the multiply finctions to be executed in the forward step of a Lambda node
