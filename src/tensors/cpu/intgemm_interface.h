@@ -9,8 +9,6 @@
 
 #include "oneapi/dnnl/dnnl.hpp"
 
-static bool USE_NEW_PATH = std::getenv("USE_NEW_PATH") != nullptr;
-
 static inline void printDNNLStatus(dnnl::status& status) {
   if (status == dnnl::status::success) {
       std::cout << "DNNL success." << std::endl;
@@ -77,25 +75,31 @@ inline matmul::primitive_desc make_matmul_primitive(matmul_variant variant) {
   
   dnnl::memory::desc a_md(rt_rt_dims, variant.shifted ? dt::u8 : dt::s8,  a_dims_strides);
   dnnl::memory::desc b_md(rt_rt_dims, dt::s8,  b_dims_strides);
-  dnnl::memory::desc c_md(rt_rt_dims, USE_NEW_PATH ? dt::f32 : dt::s32, c_dims_strides);
+  dnnl::memory::desc c_md(rt_rt_dims, dt::f32, c_dims_strides);
   
   dnnl::primitive_attr attr;
   attr.set_output_scales(/* mask */ 0, {DNNL_RUNTIME_F32_VAL});
-  
-  if (USE_NEW_PATH && variant.bias) {
-    attr.set_zero_points(DNNL_ARG_DST, /* mask */ 2, {DNNL_RUNTIME_S32_VAL});
-  }
 
-  if (USE_NEW_PATH && variant.relu) {
+  if (variant.relu) {
     dnnl::post_ops ops;
     ops.append_eltwise(1.0, dnnl::algorithm::eltwise_relu, 0.f, 0.f);
     attr.set_post_ops(ops);
   }
 
-  matmul::desc matmul_d(a_md, b_md, c_md);
-  matmul::primitive_desc matmul_pd(matmul_d, attr, eng, true);
+  if (variant.shifted) {
+    ABORT("variant.shifted does not give correct outputs yet");
+    // https://oneapi-src.github.io/oneDNN/dev_guide_matmul.html?highlight=set_zero_points#attributes-and-post-ops
+    attr.set_zero_points(DNNL_ARG_SRC, /* mask */ 2, {DNNL_RUNTIME_S32_VAL});
+  }
 
-  return matmul_pd;
+  if (variant.bias) {
+    dnnl::memory::desc bias_md(rt_1_dims, dt::f32, {DNNL_RUNTIME_DIM_VAL, 0});
+    matmul::desc matmul_d(a_md, b_md, bias_md, c_md);
+    return matmul::primitive_desc(matmul_d, attr, eng, true);
+  } else {
+    matmul::desc matmul_d(a_md, b_md, c_md);
+    return matmul::primitive_desc(matmul_d, attr, eng, true);
+  }
 }
 
 template <typename src_t, typename dst_t>
@@ -131,6 +135,7 @@ static inline Expr prepareA(Expr a, Expr bPreppd, bool shifted=false) { // @TODO
     }
     typedef typename intgemm_<vtype>::type Integer;
     if (shifted)  {
+      // Uses a hardcoded +127 to allow for -127 in an uint8_t.
       intgemm::Int8Shift::PrepareA(in->val()->data(), /*input*/
                                       out->val()->data<int8_t>(), /*output*/
                                       quantMult, /*Quant Mult*/
@@ -710,6 +715,9 @@ static inline Expr affineOrDotTyped(Expr a, Expr bQuant, Expr bias, bool transA,
   auto aQuant = prepareA<vtype>(transA ? transpose(a) : a, bQuant, shifted); // A should not be quantized yet as seen above, hence quantize here
   
   static bool use_oneDNN = aQuant->graph()->getBackend()->useOneDNNOnly();
+  
+  ABORT_IF(use_oneDNN && shifted, "I don't want to think about shifted=True right now. Makes little sense in oneDNN context anyway");
+
   // determine the output shape m x n for A: m x k and B: k x n
   // since we transpose A beforehand we don't need to take care of transposed shapes here if using intgemm
   // if using DNNL we very much do!
@@ -774,14 +782,13 @@ static inline Expr affineOrDotTyped(Expr a, Expr bQuant, Expr bias, bool transA,
 
     dnnl::memory C_m({
       /* size   */ {rows(out->val()), cols(out->val())},
-      /* type   */ USE_NEW_PATH ? dt::f32 : dt::s32,
+      /* type   */ dt::f32,
       /* stride */ {cols(out->val()), 1}
       },
       eng,
-      USE_NEW_PATH ? (void *) out->val()->data<float>() : (void *) out->val()->data<int32_t>());
+      (void *) out->val()->data<float>());
 
-    float alphas = 1.f;
-    dnnl::memory alpha_m({{1}, dt::f32, {1}}, eng, USE_NEW_PATH ? &unquant_mult : &alphas);
+    dnnl::memory alpha_m({{1}, dt::f32, {1}}, eng, &unquant_mult);
     
     std::unordered_map<int, dnnl::memory> args{
       {DNNL_ARG_SRC, A_m},
@@ -790,11 +797,13 @@ static inline Expr affineOrDotTyped(Expr a, Expr bQuant, Expr bias, bool transA,
       {DNNL_ARG_ATTR_OUTPUT_SCALES, alpha_m}
     };
 
-    if (USE_NEW_PATH && bias) {
+    if (bias) {
       // Wait what?! Yes, OneDNN has a slightly different view of what quantisation entails:
       // https://oneapi-src.github.io/oneDNN/dev_guide_attributes_quantization.html
-      todo_convert_bias<float,int32_t>(bias->val(), -1.f * unquant_mult);
+      todo_convert_bias<float,float>(bias->val(), 1.0 / unquant_mult);
 
+      // Just for printing, using same memory but different type
+      
       dnnl::memory bias_m({
         /* size   */ {rows(bias->val()), cols(bias->val())},
         /* type   */ dt::f32,
@@ -803,37 +812,16 @@ static inline Expr affineOrDotTyped(Expr a, Expr bQuant, Expr bias, bool transA,
         eng,
         (void *) bias->val()->data<float>());
 
-      args[DNNL_ARG_ATTR_ZERO_POINTS | DNNL_ARG_DST] = bias_m;
+      args[DNNL_ARG_BIAS] = bias_m;
     }
 
     dnnl::stream s(eng);
     matmul_p.execute(s, args);
     s.wait();
-    
-    // TODO: How to get status?
 
-    // if (status != dnnl::status::success) {
-    //   printDNNLStatus(status);
-    //   ABORT("GEMM failed to run.");
-    // }
-
-    //Unquantise and add bias if necessary
-    if (!USE_NEW_PATH) {
-    if (bias && relu) {
-      UnquantiseAndAddBiasAndRelu(out->val(), bias->val(), unquant_mult);
-    } else if (bias) {
-      UnquantiseAndAddBias(out->val(), bias->val(), unquant_mult);
-    } else if (relu) {
-      JustUnquantiseRelu(out->val(), unquant_mult);
-    } else {
-      JustUnquantise(out->val(), unquant_mult);
+    if (bias) {
+      todo_convert_bias<float, float>(bias->val(), unquant_mult);
     }
-    } // USE_NEW_PATH
-
-    if (USE_NEW_PATH && bias)
-      todo_convert_bias<int32_t,float>(bias->val(), -1.f / unquant_mult);
-
-    std::cerr << "Scale: " << scale << " Variant: " << variant << "\n" << out->val()->debug() << std::endl;
   };
 
   // wrap the multiply finctions to be executed in the forward step of a Lambda node
