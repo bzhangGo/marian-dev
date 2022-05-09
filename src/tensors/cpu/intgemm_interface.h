@@ -8,6 +8,7 @@
 #include "integer_common.h"
 
 #include "oneapi/dnnl/dnnl.hpp"
+#include "oneapi/dnnl/dnnl_types.h"
 
 static inline void printDNNLStatus(dnnl::status& status) {
   if (status == dnnl::status::success) {
@@ -65,7 +66,7 @@ struct std::hash<matmul_variant> {
   }
 };
 
-inline matmul::primitive_desc make_matmul_primitive(matmul_variant variant) {
+static inline dnnl::matmul make_matmul_primitive(matmul_variant variant) {
   dims a_dims_strides{DNNL_RUNTIME_DIM_VAL, 1};
   dims b_dims_strides = variant.transB ? dims {1, DNNL_RUNTIME_DIM_VAL} : dims {DNNL_RUNTIME_DIM_VAL, 1};
   
@@ -94,12 +95,27 @@ inline matmul::primitive_desc make_matmul_primitive(matmul_variant variant) {
 
   if (variant.bias) {
     dnnl::memory::desc bias_md(rt_1_dims, dt::f32, {DNNL_RUNTIME_DIM_VAL, 0});
-    matmul::desc matmul_d(a_md, b_md, bias_md, c_md);
-    return matmul::primitive_desc(matmul_d, attr, eng, true);
+    dnnl::matmul::desc matmul_d(a_md, b_md, bias_md, c_md);
+    dnnl::matmul::primitive_desc matmul_pd(matmul_d, attr, eng, true);
+    return dnnl::matmul(matmul_pd);
   } else {
-    matmul::desc matmul_d(a_md, b_md, c_md);
-    return matmul::primitive_desc(matmul_d, attr, eng, true);
+    dnnl::matmul::desc matmul_d(a_md, b_md, c_md);
+    dnnl::matmul::primitive_desc matmul_pd(matmul_d, attr, eng, true);
+    return dnnl::matmul(matmul_pd);
   }
+}
+
+static inline dnnl::reorder make_scale_primitive() {
+  dnnl::memory::desc mem(
+    {DNNL_RUNTIME_DIM_VAL, DNNL_RUNTIME_DIM_VAL},
+    dt::f32,
+    {DNNL_RUNTIME_DIM_VAL, 1});
+
+  dnnl::primitive_attr reorder_attr;
+  reorder_attr.set_output_scales(0, {DNNL_RUNTIME_F32_VAL});
+
+  dnnl::reorder::primitive_desc reorder_pd(eng, mem, eng, mem, reorder_attr);
+  return dnnl::reorder(reorder_pd);
 }
 
 template <typename src_t, typename dst_t>
@@ -400,9 +416,7 @@ public:
         intgemm::Int8Shift::PrepareBias((const int8_t *)b->data(), rows(b), cols(b), intgemm::callbacks::UnquantizeAndAddBiasAndWrite(unquant_mult, bias->data(), val_->data()));
       } else {
         static const std::vector<uint8_t> ones(64000, 1); // Large enough static array of ones that we can use
-        static matmul::primitive_desc matmul_u8s8s32 = make_matmul_primitive({true, false, false, false});
-
-        dnnl::matmul matmul_p = matmul(matmul_u8s8s32);
+        static thread_local dnnl::matmul matmul_p = make_matmul_primitive({true, false, false, false});
 
         dnnl::memory A_m({
             /* size   */ {1, rows(b)},
@@ -494,9 +508,7 @@ public:
     } else {
       static const std::vector<uint8_t> ones(64000, 1); // Large enough static array of ones that we can use
 
-      static matmul::primitive_desc matmul_u8s8s32 = make_matmul_primitive({true, false, false, false});
-
-      dnnl::matmul matmul_p = matmul(matmul_u8s8s32);
+      static thread_local dnnl::matmul matmul_p = make_matmul_primitive({true, false, false, false});
 
       dnnl::memory A_m({
           /* size   */ {1, rows(b)},
@@ -743,19 +755,24 @@ static inline Expr affineOrDotTyped(Expr a, Expr bQuant, Expr bias, bool transA,
     float unquant_mult = 1.0f / (aQuantMult * bQuantMult);
     unquant_mult = unquant_mult * scale;
 
-    // std::cerr << "dnnlDotOrAffineNodeOp" << (shifted ? " shifted" : "") << (transB ? " transB" : "") << std::endl;
+    float inv_unquant_mult = 1.0f / unquant_mult;
 
     // Describe a variant of the matmul primitive we'll need. Does it need to add bias? relu? etc.
     const matmul_variant variant{shifted, transB, bias ? true : false, relu};
+    // std::cerr << variant
+    //   << " M:" << rows(aQuant->val())
+    //   << " N:" << (transB ? cols(bQuant->val()) : rows(bQuant->val()))
+    //   << " O:" << (bias ? cols(bias->val()) : -1)
+    //   << std::endl;
 
     // Here we have our wee cache of matmul primitive descriptors for each variant
-    thread_local static std::unordered_map<matmul_variant, matmul::primitive_desc> matmul_x8s8s32;
+    static thread_local std::unordered_map<matmul_variant, dnnl::matmul> matmul_x8s8s32;
     auto matmul_p_it = matmul_x8s8s32.find(variant);
     if (matmul_p_it == matmul_x8s8s32.end())
       std::tie(matmul_p_it, std::ignore) = matmul_x8s8s32.emplace(std::make_pair(variant, make_matmul_primitive(variant)));
     
     // Construct the primitive itself
-    dnnl::matmul matmul_p = matmul(matmul_p_it->second);
+    dnnl::matmul &matmul_p = matmul_p_it->second;
 
     dnnl::memory A_m({
         /* size   */ {rows(aQuant->val()), cols(aQuant->val())},
@@ -789,6 +806,8 @@ static inline Expr affineOrDotTyped(Expr a, Expr bQuant, Expr bias, bool transA,
       (void *) out->val()->data<float>());
 
     dnnl::memory alpha_m({{1}, dt::f32, {1}}, eng, &unquant_mult);
+
+    dnnl::stream s(eng);
     
     std::unordered_map<int, dnnl::memory> args{
       {DNNL_ARG_SRC, A_m},
@@ -800,7 +819,8 @@ static inline Expr affineOrDotTyped(Expr a, Expr bQuant, Expr bias, bool transA,
     if (bias) {
       // Wait what?! Yes, OneDNN has a slightly different view of what quantisation entails:
       // https://oneapi-src.github.io/oneDNN/dev_guide_attributes_quantization.html
-      todo_convert_bias<float,float>(bias->val(), 1.0 / unquant_mult);
+      // todo_convert_bias<float,float>(bias->val(), 1.0 / unquant_mult);
+      dnnl::memory inv_alpha_m({{1}, dt::f32, {1}}, eng, &inv_unquant_mult);
 
       // Just for printing, using same memory but different type
       
@@ -812,16 +832,30 @@ static inline Expr affineOrDotTyped(Expr a, Expr bQuant, Expr bias, bool transA,
         eng,
         (void *) bias->val()->data<float>());
 
+      static thread_local dnnl::reorder scale_p = make_scale_primitive();
+
+      // 1. Scale bias
+      scale_p.execute(s, {
+        {DNNL_ARG_SRC, bias_m},
+        {DNNL_ARG_DST, bias_m},
+        {DNNL_ARG_ATTR_OUTPUT_SCALES, inv_alpha_m}
+      });
+
+      // 2. Do scaled matmul
       args[DNNL_ARG_BIAS] = bias_m;
+      matmul_p.execute(s, args);
+
+      // 3. Scale bias back to original values
+      scale_p.execute(s, {
+        {DNNL_ARG_SRC, bias_m},
+        {DNNL_ARG_DST, bias_m},
+        {DNNL_ARG_ATTR_OUTPUT_SCALES, alpha_m}
+      });
+    } else {
+      matmul_p.execute(s, args);
     }
 
-    dnnl::stream s(eng);
-    matmul_p.execute(s, args);
     s.wait();
-
-    if (bias) {
-      todo_convert_bias<float, float>(bias->val(), unquant_mult);
-    }
   };
 
   // wrap the multiply finctions to be executed in the forward step of a Lambda node
