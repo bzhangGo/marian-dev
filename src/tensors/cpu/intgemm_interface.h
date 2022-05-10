@@ -755,105 +755,95 @@ static inline Expr affineOrDotTyped(Expr a, Expr bQuant, Expr bias, bool transA,
     float unquant_mult = 1.0f / (aQuantMult * bQuantMult);
     unquant_mult = unquant_mult * scale;
 
-    float inv_unquant_mult = 1.0f / unquant_mult;
-
-    // Describe a variant of the matmul primitive we'll need. Does it need to add bias? relu? etc.
-    const matmul_variant variant{shifted, transB, bias ? true : false, relu};
-    // std::cerr << variant
-    //   << " M:" << rows(aQuant->val())
-    //   << " N:" << (transB ? cols(bQuant->val()) : rows(bQuant->val()))
-    //   << " O:" << (bias ? cols(bias->val()) : -1)
-    //   << std::endl;
-
-    // Here we have our wee cache of matmul primitive descriptors for each variant
-    static thread_local std::unordered_map<matmul_variant, dnnl::matmul> matmul_x8s8s32;
-    auto matmul_p_it = matmul_x8s8s32.find(variant);
-    if (matmul_p_it == matmul_x8s8s32.end())
-      std::tie(matmul_p_it, std::ignore) = matmul_x8s8s32.emplace(std::make_pair(variant, make_matmul_primitive(variant)));
+    dnnl::memory::desc A_md{
+      /* size   */ {DNNL_RUNTIME_DIM_VAL, cols(aQuant->val())}, // {rows(aQuant->val()), cols(aQuant->val())},
+      /* type   */ shifted ? dt::u8 : dt::s8,
+      /* stride */ {cols(aQuant->val()), 1}
+    };
     
-    // Construct the primitive itself
-    dnnl::matmul &matmul_p = matmul_p_it->second;
+    dnnl::memory::desc B_md{
+      /* size   */ transB
+        ? dims{cols(bQuant->val()), rows(bQuant->val())}
+        : dims{rows(bQuant->val()), cols(bQuant->val())},
+      /* type   */ dt::s8,
+      /* stride */ transB
+        ? dims{1, cols(bQuant->val())}
+        : dims{cols(bQuant->val()), 1}
+    };
 
-    dnnl::memory A_m({
+    dnnl::memory::desc C_md{
+      /* size   */ {DNNL_RUNTIME_DIM_VAL, cols(out->val())}, // {rows(out->val()), cols(out->val())},
+      /* type   */ dt::f32,
+      /* stride */ {cols(out->val()), 1}
+    };
+
+    dnnl::post_ops ops;
+
+    dnnl::memory A_m(
+      {
         /* size   */ {rows(aQuant->val()), cols(aQuant->val())},
         /* type   */ shifted ? dt::u8 : dt::s8,
         /* stride */ {cols(aQuant->val()), 1}
       },
       eng,
-      shifted ? (void *) aQuant->val()->data<uint8_t>()
-              : (void *) aQuant->val()->data<int8_t>());
+      shifted
+      ? (void *) aQuant->val()->data<uint8_t>()
+      : (void *) aQuant->val()->data<int8_t>());
 
-    dnnl::memory B_m(
-      transB ? dnnl::memory::desc{
-                 /* size   */ {cols(bQuant->val()), rows(bQuant->val())},
-                 /* type   */ dt::s8,
-                 /* stride */ {1, cols(bQuant->val())}
-               }
-             : dnnl::memory::desc{
-                 /* size   */ {rows(bQuant->val()), cols(bQuant->val())},
-                 /* type   */ dt::s8,
-                 /* stride */ {cols(bQuant->val()), 1}
-               },
-      eng,
-      (void *) bQuant->val()->data<int8_t>());
+    // For B_m we can reuse B_md because there are no DNNL_RUNTIME_DIM_VAL involved
+    dnnl::memory B_m(B_md, eng, (void *) bQuant->val()->data<int8_t>());
 
-    dnnl::memory C_m({
-      /* size   */ {rows(out->val()), cols(out->val())},
-      /* type   */ dt::f32,
-      /* stride */ {cols(out->val()), 1}
+    dnnl::memory C_m(
+      {
+        /* size   */ {rows(out->val()), cols(out->val())},
+        /* type   */ dt::f32,
+        /* stride */ {cols(out->val()), 1}
       },
       eng,
       (void *) out->val()->data<float>());
 
-    dnnl::memory alpha_m({{1}, dt::f32, {1}}, eng, &unquant_mult);
-
     dnnl::stream s(eng);
-    
+
     std::unordered_map<int, dnnl::memory> args{
       {DNNL_ARG_SRC, A_m},
       {DNNL_ARG_WEIGHTS, B_m},
       {DNNL_ARG_DST, C_m},
-      {DNNL_ARG_ATTR_OUTPUT_SCALES, alpha_m}
     };
-
+    
     if (bias) {
-      // Wait what?! Yes, OneDNN has a slightly different view of what quantisation entails:
-      // https://oneapi-src.github.io/oneDNN/dev_guide_attributes_quantization.html
-      // todo_convert_bias<float,float>(bias->val(), 1.0 / unquant_mult);
-      dnnl::memory inv_alpha_m({{1}, dt::f32, {1}}, eng, &inv_unquant_mult);
-
-      // Just for printing, using same memory but different type
-      
-      dnnl::memory bias_m({
+      dnnl::memory::desc bias_md{
         /* size   */ {rows(bias->val()), cols(bias->val())},
         /* type   */ dt::f32,
         /* stride */ {cols(bias->val()), 1}
-        },
-        eng,
-        (void *) bias->val()->data<float>());
+      };
 
-      static thread_local dnnl::reorder scale_p = make_scale_primitive();
+      dnnl::memory bias_m(bias_md, eng, (void *) bias->val()->data<float>());
 
-      // 1. Scale bias
-      scale_p.execute(s, {
-        {DNNL_ARG_SRC, bias_m},
-        {DNNL_ARG_DST, bias_m},
-        {DNNL_ARG_ATTR_OUTPUT_SCALES, inv_alpha_m}
-      });
+      ops.append_binary(dnnl::algorithm::binary_add, bias_md);
 
-      // 2. Do scaled matmul
-      args[DNNL_ARG_BIAS] = bias_m;
-      matmul_p.execute(s, args);
-
-      // 3. Scale bias back to original values
-      scale_p.execute(s, {
-        {DNNL_ARG_SRC, bias_m},
-        {DNNL_ARG_DST, bias_m},
-        {DNNL_ARG_ATTR_OUTPUT_SCALES, alpha_m}
-      });
-    } else {
-      matmul_p.execute(s, args);
+      args.insert({(DNNL_ARG_ATTR_MULTIPLE_POST_OP(0) | DNNL_ARG_SRC_1), bias_m});
     }
+
+    if (relu) {
+      ops.append_eltwise(1.0, dnnl::algorithm::eltwise_relu, 0.f, 0.f);
+    }
+
+    dnnl::primitive_attr attr;
+    attr.set_output_scales(/* mask */ 0, {unquant_mult});
+    attr.set_post_ops(ops); // TODO: Is this okay if I change ops afterwards?
+
+    if (shifted) {
+      ABORT("variant.shifted does not give correct outputs yet");
+      // https://oneapi-src.github.io/oneDNN/dev_guide_matmul.html?highlight=set_zero_points#attributes-and-post-ops
+      attr.set_zero_points(DNNL_ARG_SRC, /* mask */ 2, {DNNL_RUNTIME_S32_VAL});
+    }
+
+    dnnl::matmul::desc matmul_d(A_md, B_md, C_md);
+
+    dnnl::matmul::primitive_desc matmul_pd(matmul_d, attr, eng, true);
+    dnnl::matmul matmul_p(matmul_pd);
+
+    matmul_p.execute(s, args);
 
     s.wait();
   };
