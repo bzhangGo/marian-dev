@@ -222,12 +222,41 @@ struct PrepareBNodeOp : public UnaryNodeOp {
         // Use DNNL in this case, meaning we need prepareA. @TODO maybe try shifted version and also code one that doesn't care about register size
         //ABORT_IF(transpose_, "We haven't implemented DNNL transposed matrices for now.");
         auto quantMult = computeQuantMult<vtype>(child(0)->val(), name());
-        intgemm_<vtype>::width::PrepareA(child(0)->val()->data(), /*input*/
-                                      val_->data<Integer>(), /*output*/
-                                      quantMult, /*Quant Mult*/
-                                      rows(child(0)->val()),
-                                      cols(child(0)->val()));
+
         getQuantMult<vtype>(val_) = quantMult;
+
+        dnnl::primitive_attr attr;
+        attr.set_output_scales(0, {DNNL_RUNTIME_F32_VAL});
+
+        dnnl::memory input({
+            /* size   */ {rows(child(0)->val()), cols(child(0)->val())},
+            /* type   */ dt::f32,
+            /* stride */ {cols(child(0)->val()), 1}},
+                           eng,
+                           (void *) child(0)->val()->data());
+
+        dnnl::memory output({
+            /* size   */ {rows(child(0)->val()), cols(child(0)->val())},
+            /* type   */ std::is_same<Integer,  int8_t>::value ? dt::s8 :
+                         std::is_same<Integer, uint8_t>::value ? dt::u8 :
+                         dt::undef,
+            /* stride */ {cols(child(0)->val()), 1}},
+                           eng,
+                           (void *) val_->data<Integer>());
+
+        dnnl::memory scale({{1}, dt::f32, {1}}, eng, &quantMult);
+
+        dnnl::reorder::primitive_desc reorder_pd(eng, input.get_desc(), eng, output.get_desc(), attr);
+
+        dnnl::stream s(eng);
+
+        dnnl::reorder(reorder_pd).execute(s, {
+            {DNNL_ARG_SRC, input},
+            {DNNL_ARG_DST, output},
+            {DNNL_ARG_ATTR_OUTPUT_SCALES, scale}
+        });
+
+        s.wait();
       } else if (!transpose_) {
         auto quantMult = computeQuantMult<vtype>(child(0)->val(), name());
         intgemm_<vtype>::width::PrepareB(child(0)->val()->data(), /*input*/
