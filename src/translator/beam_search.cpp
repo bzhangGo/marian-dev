@@ -272,7 +272,8 @@ Beams BeamSearch::purgeBeams(const Beams& beams, /*in/out=*/std::vector<IndexTyp
   for(auto beam : beams) {
     Beam newBeam; // a beam of surviving hyps
     for(auto hyp : beam)
-      if(hyp->getWord() != trgEosId) // if this hyp is not finished,
+      // IBDecoder: the previous word is also not EOS
+      if(hyp->getWord() != trgEosId && hyp->getPrevHyp()->getWord() != trgEosId) // if this hyp is not finished,
         newBeam.push_back(hyp);      // move over to beam of surviving hyps
 
     if(PURGE_BATCH)
@@ -294,6 +295,8 @@ Histories BeamSearch::search(Ptr<ExpressionGraph> graph, Ptr<data::CorpusBatch> 
   size_t numFactorGroups = factoredVocab ? factoredVocab->getNumGroups() : 1;
   if (numFactorGroups == 1) // if no factors then we didn't need this object in the first place
     factoredVocab.reset();
+  
+  ABORT_IF(numFactorGroups > 1, "IBDecoder Only support non-factorted translation!");
 
   // We will use the prefix "origBatch..." whenever we refer to batch dimensions of the original batch. These do not change during search.
   // We will use the prefix "currentBatch.." whenever we refer to batch dimension that can change due to batch-pruning.
@@ -407,6 +410,7 @@ Histories BeamSearch::search(Ptr<ExpressionGraph> graph, Ptr<data::CorpusBatch> 
             auto& beam = beams[origBatchIdx];
             if(beamHypIdx < beam.size()) {
               auto hyp = beam[beamHypIdx];
+              auto prevHyp = hyp->getPrevHyp();   // IBDecoder: get previous hypothesis
               auto word = hyp->getWord();
               auto canExpand = (!factoredVocab || factoredVocab->canExpandFactoredWord(hyp->getWord(), factorGroup));
               //LOG(info, "[{}, {}] Can expand {} with {} -> {}", batchIdx, beamHypIdx, (*batch->back()->vocab())[hyp->getWord()], factorGroup, canExpand);
@@ -422,15 +426,18 @@ Histories BeamSearch::search(Ptr<ExpressionGraph> graph, Ptr<data::CorpusBatch> 
                                                                    // happened for factorGroup == 0
               }
 
-              auto hypIndex = (IndexType)(hyp->getPrevStateIndex() * currentDimBatch + currentBatchIdx); // (beamHypIdx, batchIdx), flattened, for index_select() operation
+              // IBDecoder: we should use the previous hypothesis for index selection
+              auto hypIndex = (IndexType)(prevHyp->getPrevStateIndex() * currentDimBatch + currentBatchIdx); // (beamHypIdx, batchIdx), flattened, for index_select() operation
 
               hypIndices.push_back(hypIndex); // (beamHypIdx, batchIdx), flattened as said above.
               prevWords .push_back(word);
+              prevWords .push_back(prevHyp->getWord()); // IBDecoder: add another previous word
               prevScores.push_back(canExpand ? hyp->getPathScore() : INVALID_PATH_SCORE);
             } else {  // pad to maxBeamSize (dummy hypothesis)
               if(!PURGE_BATCH || !beam.empty()) { // but only if we are not pruning and the beam is not deactivated yet
                 hypIndices.push_back(0);
                 prevWords.push_back(trgEosId);    // (unused, but must be valid)
+                prevWords.push_back(trgEosId);    // IBDecoder: two words each time
                 prevScores.push_back((float)INVALID_PATH_SCORE);
               }
             }
@@ -446,7 +453,11 @@ Histories BeamSearch::search(Ptr<ExpressionGraph> graph, Ptr<data::CorpusBatch> 
 
       //**********************************************************************
       // compute expanded path scores with word prediction probs from all scorers
-      auto expandedPathScores = prevPathScores; // will become [maxBeamSize, 1, currDimBatch, dimVocab]
+      // auto expandedPathScores = prevPathScores; // will become [maxBeamSize, 1, currDimBatch, dimVocab]
+      // IBDecoder: first we predict output probabilities for the next two words
+      //   Let's first extract top-K predictions from these two predictions to reduce the search space,
+      //   Then, we could perform beam search; so the initial expandedPathScores will be 0.
+      auto expandedPathScores = graph->constant({1, 1, 1, 1}, inits::fromValue(0));
       Expr logProbs;
       for(size_t i = 0; i < scorers_.size(); ++i) {
         if (factorGroup == 0) {
@@ -487,7 +498,8 @@ Histories BeamSearch::search(Ptr<ExpressionGraph> graph, Ptr<data::CorpusBatch> 
       }
 
       // make beams continuous
-      expandedPathScores = swapAxes(expandedPathScores, 0, 2); // -> [currentDimBatch, 1, maxBeamSize, dimVocab]
+      // IBDecoder: there will be two words predicted outside
+      expandedPathScores = swapAxes(expandedPathScores, 0, 2); // -> [currentDimBatch, 2, maxBeamSize, dimVocab]
 
       // perform NN computation
       if(t == 0 && factorGroup == 0)
@@ -505,27 +517,88 @@ Histories BeamSearch::search(Ptr<ExpressionGraph> graph, Ptr<data::CorpusBatch> 
       //**********************************************************************
       // perform beam search
 
-      // find N best amongst the (maxBeamSize * dimVocab) hypotheses
-      std::vector<unsigned int> nBestKeys; // [currentDimBatch, maxBeamSize] flattened -> (batchIdx, beamHypIdx, word idx) flattened
-      std::vector<float> nBestPathScores;  // [currentDimBatch, maxBeamSize] flattened
-      getNBestList(/*in*/   expandedPathScores->val(),   // [currentDimBatch, 1, maxBeamSize, dimVocab or dimShortlist]
-                  /*N=*/    maxBeamSize,                 // desired beam size
-                  /*out*/   nBestPathScores,
-                   /*out*/  nBestKeys,
-                  /*first=*/t == 0 && factorGroup == 0); // @TODO: this is only used for checking presently, and should be removed altogether
-      // Now, nBestPathScores contain N-best expandedPathScores for each batch and beam,
-      // and nBestKeys for each their original location (batchIdx, beamHypIdx, word).
+      // IBDecoder: 1) find N best local preditions among the (maxBeamSize * dimVocab) hypothesis
+      std::vector<unsigned int> nBestLocalKeys; // [currentDimBatch, 2, maxBeamSize] flattened -> (batchIdx*2, beamHypIdx, word idx) flattened
+      std::vector<float> nBestLocalPathScores;  // [currentDimBatch, 2, maxBeamSize] flattened
+      auto epsShape = expandedPathScores->shape();
+      expandedPathScores = reshape(expandedPathScores, {epsShape[-4]*2*epsShape[-2], 1, 1, epsShape[-1]});
+      size_t topN = maxBeamSize/2;
+      if(topN < 1)
+        topN = 1;
 
-      // combine N-best sets with existing search space (beams) to updated search space
-      beams = toHyps(nBestKeys, nBestPathScores,
-                     /*nBestBeamSize*/expandedPathScores->shape()[-2], // used for interpretation of keys
-                     /*vocabSize=*/expandedPathScores->shape()[-1],    // used for interpretation of keys
-                     beams,
-                     states,            // used for keeping track of per-ensemble-member path score
-                     batch,             // only used for propagating alignment info
-                     factoredVocab, factorGroup,
-                     emptyBatchEntries, // [origDimBatch] - empty source batch entries are marked with true
-                     batchIdxMap);      // used to create a reverse batch index map to recover original batch indices for this step
+      getNBestList(/*in*/   expandedPathScores->val(),  // [currentDimBatch*2, 1, maxBeamSize, dimVocab or dimShortlist]
+                   /*N=*/   topN,                       // topK prediction
+                   /*out*/  nBestLocalPathScores,
+                   /*out*/  nBestLocalKeys,
+                   /*first*/t == 0 && factorGroup == 0
+      );
+      // auto nBestLocalKeysTensor = graph->constant(
+      //   {(int)currentDimBatch, 2, (int)maxBeamSize, (int)topN}, inits::fromVector(nBestLocalKeys));
+      auto nBestLocalPathScoresTensor = graph->constant(
+        {(int)currentDimBatch, 2, (int)maxBeamSize, (int)topN}, inits::fromVector(nBestLocalPathScores));
+
+      // std::vector<unsigned int> nBestFirstWordKeys, nBestSecondWordKeys;
+      // std::vector<float> nBestFirstWordPathScores, nBestSecondWordPathScores;
+      // auto keyIter = nBestLocalKeys.begin();
+      // auto scoreIter = nBestLocalPathScores.begin();
+      // for(size_t i = 0; i < expandedPathScores->shape()[-4]; ++ i) {
+      //   auto start = i * maxBeamSize, end = (i+1) * maxBeamSize;
+      //   if(i % 2 == 0) { // results for the first words
+      //     std::copy(keyIter+start, keyIter+end, std::back_inserter(nBestFirstWordKeys));
+      //     std::copy(scoreIter+start, scoreIter+end, std::back_inserter(nBestFirstWordPathScores));
+      //   } else {  // results for the second words
+      //     std::copy(keyIter+start, keyIter+end, std::back_inserter(nBestSecondWordKeys));
+      //     std::copy(scoreIter+start, scoreIter+end, std::back_inserter(nBestSecondWordPathScores));
+      //   }
+      // }
+
+      // IBDecoder: 2) add the predicted two words into the hypothesis
+      auto expandedPathScores = swapAxes(prevPathScores, 0, 2); // will become [currDimBatch, 1, maxBeamSize, topN]
+
+      for(size_t wordIdx = 0; wordIdx < 2; ++ wordIdx) {
+        auto currWordScores = index_select(nBestLocalPathScoresTensor, 1, {(IndexType)wordIdx});  // [currentDimBatch, 1, maxBeamSize, topN]
+        // auto currWordKeys = index_select(nBestLocalKeysTensor, 1, {(IndexType)wordIdx});
+        
+        expandedPathScores = expandedPathScores + currWordScores;
+
+        // find N best amongst the (maxBeamSize * topN) hypotheses
+        std::vector<unsigned int> nBestKeys; // [currentDimBatch, maxBeamSize] flattened -> (batchIdx, beamHypIdx, word idx) flattened
+        std::vector<float> nBestPathScores;  // [currentDimBatch, maxBeamSize] flattened
+        getNBestList(/*in*/   expandedPathScores->val(),   // [currentDimBatch, 1, maxBeamSize, topN]
+                    /*N=*/    maxBeamSize,                 // desired beam size
+                    /*out*/   nBestPathScores,
+                    /*out*/  nBestKeys,
+                    /*first=*/t == 0 && factorGroup == 0); // @TODO: this is only used for checking presently, and should be removed altogether
+        // Now, nBestPathScores contain N-best expandedPathScores for each batch and beam,
+        // and nBestKeys for each their original location (batchIdx, beamHypIdx, word).
+
+        // IBDecoder: the scores are accurate, but we need to extract the keys or the actual word ids
+        for(size_t i = 0; i < nBestKeys.size(); ++i) { // [currentDimBatch, beamSize] flattened
+          const auto  key = nBestKeys[i];
+          
+          // decompose key into individual indices (batchIdx, beamHypIdx, wordIdx)
+          const auto beamHypIdx      = (key / topN) % maxBeamSize;
+          const auto currentBatchIdx = (key / topN) / maxBeamSize;
+          const auto predIdx         = (key % topN);
+
+          // the mapping relation: [currentDimBatch, 1, maxBeamSize, topN] vs. [currentDimBatch, 2, maxBeamSize, topN]
+          size_t keyMapIdx = (2*currentBatchIdx + wordIdx) * (maxBeamSize * topN) + beamHypIdx * topN + predIdx;
+          nBestKeys[i] = nBestLocalKeys[keyMapIdx];
+        }
+
+        // combine N-best sets with existing search space (beams) to updated search space
+        beams = toHyps(nBestKeys, nBestPathScores,
+                      /*nBestBeamSize*/expandedPathScores->shape()[-2], // used for interpretation of keys
+                      /*vocabSize=*/expandedPathScores->shape()[-1],    // used for interpretation of keys
+                      beams,
+                      states,            // used for keeping track of per-ensemble-member path score
+                      batch,             // only used for propagating alignment info
+                      factoredVocab, factorGroup,
+                      emptyBatchEntries, // [origDimBatch] - empty source batch entries are marked with true
+                      batchIdxMap);      // used to create a reverse batch index map to recover original batch indices for this step
+        
+        expandedPathScores = graph->constant({(int)currentDimBatch, 1, (int)maxBeamSize, 1}, inits::fromVector(nBestPathScores));
+      }
     } // END FOR factorGroup = 0 .. numFactorGroups-1
 
     prevBatchIdxMap = batchIdxMap; // save current batchIdx map to be used in next step; we are then going to look one step back

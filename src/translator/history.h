@@ -27,7 +27,8 @@ public:
   void add(const Beam& beam, Word trgEosId, bool last = false) {
     if(beam.back()->getPrevHyp() != nullptr) { // if not start hyp do
       for(size_t beamIdx = 0; beamIdx < beam.size(); ++beamIdx)
-        if(beam[beamIdx]->getWord() == trgEosId || last) { // if this is a final hyp do
+        // IBDecoder: if the previous or the current word is EOS, it means this is a final hyp
+        if(beam[beamIdx]->getWord() == trgEosId || beam[beamIdx]->getPrevHyp()->getWord() == trgEosId || last) { // if this is a final hyp do
           float pathScore = (beam[beamIdx]->getPathScore() - wordPenalty(history_.size())) / lengthPenalty(history_.size()); // get and normalize path score
           topHyps_.push({history_.size(), beamIdx, pathScore}); // push final hyp on queue of scored hyps
         }

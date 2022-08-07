@@ -746,6 +746,9 @@ public:
     // Used for position embeddings and creating new decoder states.
     int startPos = (int)state->getPosition();
 
+    // IBDecoder: not change the positional encoding here because of
+    //   1) Change the source code to make it compatible to ibdecoder is non-trival
+    //   2) When Average/Recurrent decoder is applied, the impact of pos-encoding decreases
     auto scaledEmbeddings = addSpecialEmbeddings(embeddings, startPos); // TODO1
     scaledEmbeddings = atleast_nd(scaledEmbeddings, 4);
 
@@ -913,7 +916,8 @@ public:
       nextState = New<TransformerState>(
         decoderStates, logits, state->getEncoderStates(), state->getBatch());
     }
-    nextState->setPosition(state->getPosition() + 1);
+    // IBDecoder: change position offset 1->2
+    nextState->setPosition(state->getPosition() + 2);
     return nextState;
   }
 
