@@ -48,16 +48,20 @@ public:
     : options_(New<Options>(options->clone())) { // @TODO: clone should return Ptr<Options> same as "with"?
     // This is currently safe as the translator is either created stand-alone or
     // or config is created anew from Options in the validator
+    LOG(info, "Before inference");
 
     options_->set("inference", true,
                   "shuffle", "none");
 
     corpus_ = New<data::Corpus>(options_, true);
-
+    LOG(info, "before vocab");
+    
     auto vocabs = options_->get<std::vector<std::string>>("vocabs");
     trgVocab_ = New<Vocab>(options_, vocabs.size() - 1);
     trgVocab_->load(vocabs.back());
     auto srcVocab = corpus_->getVocabs()[0];
+
+    LOG(info, "Before shortlist");
 
     if(options_->hasAndNotEmpty("shortlist"))
       shortlistGenerator_ = New<data::LexicalShortlistGenerator>(
@@ -65,6 +69,8 @@ public:
 
     auto devices = Config::getDevices(options_);
     numDevices_ = devices.size();
+
+    LOG(info, "Before thread pool");
 
     ThreadPool threadPool(numDevices_, numDevices_);
     scorers_.resize(numDevices_);
@@ -80,6 +86,7 @@ public:
     }
 #endif
 
+    LOG(info, "Loading graph");
     size_t id = 0;
     for(auto device : devices) {
       auto task = [&](DeviceId device, size_t id) {
@@ -110,6 +117,8 @@ public:
       threadPool.enqueue(task, device, id++);
     }
 
+    LOG(info, "Before output sampling!");
+
     if(options_->get<bool>("output-sampling", false)) {
       if(options_->get<size_t>("beam-size") > 1)
         LOG(warn,
@@ -120,6 +129,8 @@ public:
             "[warning] Output sampling and model ensembling are contradictory methods and using "
             "them together is not recommended. Use a single model");
     }
+
+    LOG(info, "Translation Initialization Finished!");
   }
 
   void run() override {

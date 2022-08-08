@@ -35,6 +35,21 @@ public:
 
       if(reverse_)
         std::reverse(words.begin(), words.end());
+      
+      // IBDecoder: reorder the generated words
+      Words newWords; size_t wSize = 0;
+      while(wSize < words.size()){
+        if(words[wSize] == vocab_->getEosId())
+          break;
+        wSize += 1;
+      }
+      for(size_t j = 0; j < wSize; j += 2)
+        newWords.push_back(words[j]);
+      for(int j = wSize - 1 - wSize % 2; j >= 0; j -= 2)
+        newWords.push_back(words[j]);
+      if(wSize < words.size()-1)
+        newWords.push_back(vocab_->getEosId());
+      words = newWords;
 
       std::string translation = vocab_->decode(words);
       bestn << history->getLineNum() << " ||| " << translation;
@@ -68,6 +83,21 @@ public:
 
     if(reverse_)
       std::reverse(words.begin(), words.end());
+  
+    // IBDecoder: reorder the generated words
+    Words newWords; size_t wSize = 0;
+    while(wSize < words.size()){
+      if(words[wSize] == vocab_->getEosId())
+        break;
+      wSize += 1;
+    }
+    for(size_t j = 0; j < wSize; j += 2)
+      newWords.push_back(words[j]);
+    for(int j = wSize - 1 - wSize % 2; j >= 0; j -= 2)
+      newWords.push_back(words[j]);
+    if(wSize < words.size()-1)
+      newWords.push_back(vocab_->getEosId());
+    words = newWords;
 
     std::string translation = vocab_->decode(words);
 

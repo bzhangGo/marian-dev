@@ -304,7 +304,9 @@ Histories BeamSearch::search(Ptr<ExpressionGraph> graph, Ptr<data::CorpusBatch> 
   const auto trgEosId = trgVocab_->getEosId();
   const auto trgUnkId = trgVocab_->getUnkId();
 
-  auto getNBestList = createGetNBestListFn(beamSize_, origDimBatch, graph->getDeviceId());
+  // IBDecoder: the batch size is adjusted
+  auto getNBestListIBDecoder = createGetNBestListFn(beamSize_, beamSize_*origDimBatch*2, graph->getDeviceId());
+
   allocator_ = graph->getTensorAllocator();
 
   for(auto scorer : scorers_) {
@@ -457,7 +459,7 @@ Histories BeamSearch::search(Ptr<ExpressionGraph> graph, Ptr<data::CorpusBatch> 
       // IBDecoder: first we predict output probabilities for the next two words
       //   Let's first extract top-K predictions from these two predictions to reduce the search space,
       //   Then, we could perform beam search; so the initial expandedPathScores will be 0.
-      auto expandedPathScores = graph->constant({1, 1, 1, 1}, inits::fromValue(0));
+      auto expandedScores = graph->constant({1, 1, 1, 1}, inits::fromValue(0));
       Expr logProbs;
       for(size_t i = 0; i < scorers_.size(); ++i) {
         if (factorGroup == 0) {
@@ -494,12 +496,12 @@ Histories BeamSearch::search(Ptr<ExpressionGraph> graph, Ptr<data::CorpusBatch> 
           logProbs = states[i]->getLogProbs().getFactoredLogits(factorGroup, /*shortlist=*/ nullptr, hypIndices, maxBeamSize); // [maxBeamSize, 1, currentDimBatch, dimVocab]
         }
         // expand all hypotheses, [maxBeamSize, 1, currentDimBatch, 1] -> [maxBeamSize, 1, currentDimBatch, dimVocab]
-        expandedPathScores = expandedPathScores + scorers_[i]->getWeight() * logProbs;
+        expandedScores = expandedScores + scorers_[i]->getWeight() * logProbs;
       }
 
       // make beams continuous
       // IBDecoder: there will be two words predicted outside
-      expandedPathScores = swapAxes(expandedPathScores, 0, 2); // -> [currentDimBatch, 2, maxBeamSize, dimVocab]
+      expandedScores = swapAxes(expandedScores, 0, 2); // -> [currentDimBatch, 2, maxBeamSize, dimVocab]
 
       // perform NN computation
       if(t == 0 && factorGroup == 0)
@@ -510,86 +512,85 @@ Histories BeamSearch::search(Ptr<ExpressionGraph> graph, Ptr<data::CorpusBatch> 
       //**********************************************************************
       // suppress specific symbols if not at right positions
       if(unkColId != -1 && factorGroup == 0)
-        suppressWord(expandedPathScores, unkColId);
+        suppressWord(expandedScores, unkColId);
       for(auto state : states)
-        state->blacklist(expandedPathScores, batch);
+        state->blacklist(expandedScores, batch);
 
       //**********************************************************************
       // perform beam search
 
       // IBDecoder: 1) find N best local preditions among the (maxBeamSize * dimVocab) hypothesis
       std::vector<unsigned int> nBestLocalKeys; // [currentDimBatch, 2, maxBeamSize] flattened -> (batchIdx*2, beamHypIdx, word idx) flattened
-      std::vector<float> nBestLocalPathScores;  // [currentDimBatch, 2, maxBeamSize] flattened
-      auto epsShape = expandedPathScores->shape();
-      expandedPathScores = reshape(expandedPathScores, {epsShape[-4]*2*epsShape[-2], 1, 1, epsShape[-1]});
-      size_t topN = maxBeamSize/2;
-      if(topN < 1)
-        topN = 1;
+      std::vector<float> nBestLocalScores;  // [currentDimBatch, 2, maxBeamSize] flattened
+      auto epsShape = expandedScores->shape();
+      // Note here we first compress the prediction for each word independently to reduce the search space and 
+      // hopefully increase running efficiency
+      expandedScores = reshape(expandedScores, {epsShape[-4]*2*epsShape[-2], 1, 1, epsShape[-1]});
+      size_t topN = maxBeamSize;
+      size_t actualBeamSize = epsShape[-2], vocabSize = epsShape[-1];
 
-      getNBestList(/*in*/   expandedPathScores->val(),  // [currentDimBatch*2, 1, maxBeamSize, dimVocab or dimShortlist]
-                   /*N=*/   topN,                       // topK prediction
-                   /*out*/  nBestLocalPathScores,
-                   /*out*/  nBestLocalKeys,
-                   /*first*/t == 0 && factorGroup == 0
+      getNBestListIBDecoder(/*in*/   expandedScores->val(),  // [currentDimBatch*2, 1, actualBeamSize, dimVocab or dimShortlist]
+                            /*N=*/   topN,                   // topK prediction
+                            /*out*/  nBestLocalScores,
+                            /*out*/  nBestLocalKeys,
+                            /*first*/true                    // the beam size dimension is always 1 so set the first flag to true
       );
-      // auto nBestLocalKeysTensor = graph->constant(
-      //   {(int)currentDimBatch, 2, (int)maxBeamSize, (int)topN}, inits::fromVector(nBestLocalKeys));
-      auto nBestLocalPathScoresTensor = graph->constant(
-        {(int)currentDimBatch, 2, (int)maxBeamSize, (int)topN}, inits::fromVector(nBestLocalPathScores));
-
-      // std::vector<unsigned int> nBestFirstWordKeys, nBestSecondWordKeys;
-      // std::vector<float> nBestFirstWordPathScores, nBestSecondWordPathScores;
-      // auto keyIter = nBestLocalKeys.begin();
-      // auto scoreIter = nBestLocalPathScores.begin();
-      // for(size_t i = 0; i < expandedPathScores->shape()[-4]; ++ i) {
-      //   auto start = i * maxBeamSize, end = (i+1) * maxBeamSize;
-      //   if(i % 2 == 0) { // results for the first words
-      //     std::copy(keyIter+start, keyIter+end, std::back_inserter(nBestFirstWordKeys));
-      //     std::copy(scoreIter+start, scoreIter+end, std::back_inserter(nBestFirstWordPathScores));
-      //   } else {  // results for the second words
-      //     std::copy(keyIter+start, keyIter+end, std::back_inserter(nBestSecondWordKeys));
-      //     std::copy(scoreIter+start, scoreIter+end, std::back_inserter(nBestSecondWordPathScores));
-      //   }
-      // }
+      auto nBestLocalScoresTensor = graph->constant(
+        {(int)currentDimBatch, 2, (int)actualBeamSize, (int)topN}, inits::fromVector(nBestLocalScores));
 
       // IBDecoder: 2) add the predicted two words into the hypothesis
-      auto expandedPathScores = swapAxes(prevPathScores, 0, 2); // will become [currDimBatch, 1, maxBeamSize, topN]
+      auto expandedPathScores = swapAxes(prevPathScores, 0, 2); // will become [currDimBatch, 1, actualBeamSize, topN]
 
       for(size_t wordIdx = 0; wordIdx < 2; ++ wordIdx) {
-        auto currWordScores = index_select(nBestLocalPathScoresTensor, 1, {(IndexType)wordIdx});  // [currentDimBatch, 1, maxBeamSize, topN]
-        // auto currWordKeys = index_select(nBestLocalKeysTensor, 1, {(IndexType)wordIdx});
+        auto currWordScores = index_select(nBestLocalScoresTensor, 1, {(IndexType)wordIdx});  // [currentDimBatch, 1, actualBeamSize, topN]
         
+        // Shape: [currentDimBatch, 1, actualBeamSize, topN]
         expandedPathScores = expandedPathScores + currWordScores;
 
-        // find N best amongst the (maxBeamSize * topN) hypotheses
+        // perform NN computation: from my understanding, this will reschedule and compact the memory layout (no computation fired)
+        if(t == 0 && factorGroup == 0 && wordIdx == 0)
+          graph->forward();
+        else
+          graph->forwardNext();
+
+        // find N best amongst the (actualBeamSize * topN) hypotheses
         std::vector<unsigned int> nBestKeys; // [currentDimBatch, maxBeamSize] flattened -> (batchIdx, beamHypIdx, word idx) flattened
         std::vector<float> nBestPathScores;  // [currentDimBatch, maxBeamSize] flattened
-        getNBestList(/*in*/   expandedPathScores->val(),   // [currentDimBatch, 1, maxBeamSize, topN]
-                    /*N=*/    maxBeamSize,                 // desired beam size
-                    /*out*/   nBestPathScores,
-                    /*out*/  nBestKeys,
-                    /*first=*/t == 0 && factorGroup == 0); // @TODO: this is only used for checking presently, and should be removed altogether
+        getNBestListIBDecoder(/*in*/   expandedPathScores->val(),   // [currentDimBatch, 1, actualBeamSize, topN]
+                              /*N=*/   maxBeamSize,                 // desired beam size
+                              /*out*/  nBestPathScores,
+                              /*out*/  nBestKeys,
+                              /*first=*/t == 0 && factorGroup == 0 && wordIdx == 0); // @TODO: this is only used for checking presently, and should be removed altogether
         // Now, nBestPathScores contain N-best expandedPathScores for each batch and beam,
         // and nBestKeys for each their original location (batchIdx, beamHypIdx, word).
 
-        // IBDecoder: the scores are accurate, but we need to extract the keys or the actual word ids
-        for(size_t i = 0; i < nBestKeys.size(); ++i) { // [currentDimBatch, beamSize] flattened
+        // IBDecoder: the scores are accurate, but we need to extract the keys for the actual word ids
+        for(size_t i = 0; i < nBestKeys.size(); ++i) { // [currentDimBatch, maxBeamSize] flattened
           const auto  key = nBestKeys[i];
           
           // decompose key into individual indices (batchIdx, beamHypIdx, wordIdx)
-          const auto beamHypIdx      = (key / topN) % maxBeamSize;
-          const auto currentBatchIdx = (key / topN) / maxBeamSize;
+          const auto beamHypIdx      = (key / topN) % actualBeamSize;
+          const auto currentBatchIdx = (key / topN) / actualBeamSize;
           const auto predIdx         = (key % topN);
+          
+          // update the Keys to reflect the actual position of nBestKeys in nBestLocalKeys
+          // the mapping relation: [currentDimBatch, 1, maxBeamSize, topN] vs. [currentDimBatch, 2, actualBeamSize, topN]
+          size_t keyMapIdx = (2*currentBatchIdx + wordIdx) * (actualBeamSize * topN) + beamHypIdx * topN + predIdx;
+          if(wordIdx == 1 && t == 0)
+            keyMapIdx = (2*currentBatchIdx + wordIdx) * (1 * topN) + 0 * topN + predIdx; // start position, only 1-size beam
+          const auto newKey = nBestLocalKeys[keyMapIdx];
 
-          // the mapping relation: [currentDimBatch, 1, maxBeamSize, topN] vs. [currentDimBatch, 2, maxBeamSize, topN]
-          size_t keyMapIdx = (2*currentBatchIdx + wordIdx) * (maxBeamSize * topN) + beamHypIdx * topN + predIdx;
-          nBestKeys[i] = nBestLocalKeys[keyMapIdx];
+          // decompose the newKey and reencode the topHyps-requied information (currentBatchIdx, beamHypIdx, wordIdx)
+          // notcie: both keys encode the same batch and beam index, but with different value (topN index vs. vocabulary index)
+          const auto vocabIdx        = (newKey % vocabSize);
+
+          nBestKeys[i] = currentBatchIdx * (actualBeamSize * vocabSize) + beamHypIdx * vocabSize + vocabIdx;
         }
 
         // combine N-best sets with existing search space (beams) to updated search space
         beams = toHyps(nBestKeys, nBestPathScores,
-                      /*nBestBeamSize*/expandedPathScores->shape()[-2], // used for interpretation of keys
-                      /*vocabSize=*/expandedPathScores->shape()[-1],    // used for interpretation of keys
+                      /*nBestBeamSize*/actualBeamSize, // used for interpretation of keys
+                      /*vocabSize=*/vocabSize,         // used for interpretation of keys
                       beams,
                       states,            // used for keeping track of per-ensemble-member path score
                       batch,             // only used for propagating alignment info
@@ -597,7 +598,38 @@ Histories BeamSearch::search(Ptr<ExpressionGraph> graph, Ptr<data::CorpusBatch> 
                       emptyBatchEntries, // [origDimBatch] - empty source batch entries are marked with true
                       batchIdxMap);      // used to create a reverse batch index map to recover original batch indices for this step
         
-        expandedPathScores = graph->constant({(int)currentDimBatch, 1, (int)maxBeamSize, 1}, inits::fromVector(nBestPathScores));
+
+        // Should I reupdate the beam size here??
+        // maxBeamSize = 0;
+        // for(auto& beam : beams)
+        //   if(beam.size() > maxBeamSize)
+        //     maxBeamSize = beam.size();
+        // if (maxBeamSize == 0)
+        //   break;
+
+        // After updating the beam, re-collect new path-wise scores      
+        std::vector<float> prevScores;         
+        for(size_t beamHypIdx = 0; beamHypIdx < maxBeamSize; ++beamHypIdx) { // loop over globally maximal beam-size (maxBeamSize)
+          for(int origBatchIdx = 0; origBatchIdx < origDimBatch; ++origBatchIdx) { // loop over all batch entries (active and inactive)
+            auto& beam = beams[origBatchIdx];
+ 
+            if(beamHypIdx < beam.size()) {
+              auto hyp = beam[beamHypIdx];
+              auto canExpand = (!factoredVocab || factoredVocab->canExpandFactoredWord(hyp->getWord(), factorGroup));
+ 
+              prevScores.push_back(canExpand ? hyp->getPathScore() : INVALID_PATH_SCORE);
+            } else {  // pad to maxBeamSize (dummy hypothesis)
+              if(!PURGE_BATCH || !beam.empty()) { // but only if we are not pruning and the beam is not deactivated yet
+                prevScores.push_back((float)INVALID_PATH_SCORE);
+              }
+            }
+         }
+        }
+        expandedPathScores = graph->constant({(int)maxBeamSize, 1, (int)currentDimBatch, 1}, inits::fromVector(prevScores));
+        expandedPathScores = swapAxes(expandedPathScores, 0, 2);
+        actualBeamSize = maxBeamSize;
+
+        // expandedPathScores = graph->constant({(int)currentDimBatch, 1, (int)maxBeamSize, 1}, inits::fromVector(nBestPathScores));
       }
     } // END FOR factorGroup = 0 .. numFactorGroups-1
 

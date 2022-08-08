@@ -69,10 +69,11 @@ public:
     // IBDecoder: one word prediction to two words prediction
     if(words.empty())
       selectedEmbs = graph_->constant({1, 2, dimBatch, dimEmb}, inits::zeros());
-    else
+    else {
       selectedEmbs = embeddingLayer->apply(words, {dimBeam, dimBatch, 2, dimEmb});
       // IBDecoder: reorder the shaping
       selectedEmbs = swapAxes(selectedEmbs, 1, 2);  // [dimBeam, 2, dimBatch, dimEmb]
+    }
     state->setTargetHistoryEmbeddings(selectedEmbs);
   }
 

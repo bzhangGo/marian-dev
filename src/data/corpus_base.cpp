@@ -416,7 +416,8 @@ void CorpusBase::addWordsToSentenceTuple(const std::string& line,
 
     // Note if EOS is added to the sequence, skip it when performing interleaving
     size_t offset = 1 + addEOS_[batchIndex];
-    for(size_t i = 0, j = numWords-offset; i <= j; ++i, --j) {
+    // LOG(info, "[data] Previous Word Infor: Size {}, Offset {}", words.size(), offset);
+    for(int i = 0, j = numWords-offset; i <= j; ++i, --j) {
       newWords.push_back(words[i]);
       if(i < j)
         newWords.push_back(words[j]);
