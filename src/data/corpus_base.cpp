@@ -409,7 +409,8 @@ void CorpusBase::addWordsToSentenceTuple(const std::string& line,
   // IBDecoder: interleave target sequence during training
   // The rule is: A B C D -> A D B C
   //              A B C D E -> A E B D C
-  if(!inference_ && batchIndex == 1) {  // during training and for the target stream
+  auto scoring_ = options_->get<bool>("scoring", false);
+  if((scoring_ || !inference_) && batchIndex == 1) {  // during training and for the target stream
     auto numWords = words.size();
     Words newWords;
     LOG_ONCE(info, "[data] Applying interleave operation to Stream {}", batchIndex);

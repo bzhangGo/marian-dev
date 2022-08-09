@@ -546,10 +546,10 @@ Histories BeamSearch::search(Ptr<ExpressionGraph> graph, Ptr<data::CorpusBatch> 
       localTopNScores           = reshape(localTopNScores, {(int)(localTopNScores->shape().elements()/(topN*topN)), 1, 1, (int)(topN*topN)});
 
       // perform NN computation
-      if(t == 0 && factorGroup == 0)
-        graph->forward();
-      else
-        graph->forwardNext();
+      // if(t == 0 && factorGroup == 0)
+      //   graph->forward();
+      // else
+      graph->forwardNext();
 
       std::vector<unsigned int> nBestPairKeys; // [currentDimBatch, maxBeamSize] flattened -> (batchIdx, word1 topn index, word2 topn idx) flattened
       std::vector<float> nBestPairScores;  // [currentDimBatch, maxBeamSize] flattened
@@ -567,10 +567,10 @@ Histories BeamSearch::search(Ptr<ExpressionGraph> graph, Ptr<data::CorpusBatch> 
       expandedPathScores = expandedPathScores + nBestPairTopNScores;
 
       // perform NN computation
-      if(t == 0 && factorGroup == 0)
-        graph->forward();
-      else
-        graph->forwardNext();
+      // if(t == 0 && factorGroup == 0)
+      //   graph->forward();
+      // else
+      graph->forwardNext();
 
       //**********************************************************************
       // perform beam search
