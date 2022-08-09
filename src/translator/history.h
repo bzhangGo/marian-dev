@@ -28,8 +28,8 @@ public:
     if(beam.back()->getPrevHyp() != nullptr) { // if not start hyp do
       for(size_t beamIdx = 0; beamIdx < beam.size(); ++beamIdx)
         // IBDecoder: if the previous or the current word is EOS, it means this is a final hyp
-        if(beam[beamIdx]->getWord() == trgEosId || beam[beamIdx]->getPrevHyp()->getWord() == trgEosId || last) { // if this is a final hyp do
-          float pathScore = (beam[beamIdx]->getPathScore() - wordPenalty(history_.size())) / lengthPenalty(history_.size()); // get and normalize path score
+        if(beam[beamIdx]->getWord() == trgEosId || beam[beamIdx]->getSecondWord() == trgEosId || last) { // if this is a final hyp do
+          float pathScore = (beam[beamIdx]->getPathScore() - wordPenalty(history_.size()*2)) / lengthPenalty(history_.size()*2); // get and normalize path score
           topHyps_.push({history_.size(), beamIdx, pathScore}); // push final hyp on queue of scored hyps
         }
     }
@@ -93,9 +93,9 @@ private:
   std::vector<Beam> history_; // [time step][index into beam] search grid @TODO: simplify as this is currently an expensive length count
   std::priority_queue<SentenceHypothesisCoord> topHyps_; // all sentence hypotheses (those that reached eos), sorted by score
   size_t lineNo_;
+  const Word eosId_;
   float alpha_;
   float wp_;
-  Word eosId_;
 };
 
 typedef std::vector<Ptr<History>> Histories; // [batchDim]

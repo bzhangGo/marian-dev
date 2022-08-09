@@ -29,7 +29,7 @@ public:
   {}
 
   // combine new expandedPathScores and previous beams into new set of beams
-  Beams toHyps(const std::vector<unsigned int>& nBestKeys, // [currentDimBatch, beamSize] flattened -> ((batchIdx, beamHypIdx) flattened, word idx) flattened
+  Beams toHyps(const std::vector<uint64_t>& nBestKeys, // [currentDimBatch, beamSize] flattened -> ((batchIdx, beamHypIdx) flattened, word idx) flattened
                const std::vector<float>& nBestPathScores,  // [currentDimBatch, beamSize] flattened
                const size_t nBestBeamSize, // for interpretation of nBestKeys
                const size_t vocabSize,     // ditto.

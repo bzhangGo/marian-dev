@@ -14,7 +14,7 @@
 namespace marian {
 
 // combine new expandedPathScores and previous beams into new set of beams
-Beams BeamSearch::toHyps(const std::vector<unsigned int>& nBestKeys, // [currentDimBatch, beamSize] flattened -> ((batchIdx, beamHypIdx) flattened, word idx) flattened
+Beams BeamSearch::toHyps(const std::vector<uint64_t>& nBestKeys, // [currentDimBatch, beamSize] flattened -> ((batchIdx, beamHypIdx) flattened, word idx) flattened
                          const std::vector<float>& nBestPathScores,  // [currentDimBatch, beamSize] flattened
                          const size_t nBestBeamSize, // for interpretation of nBestKeys
                          const size_t vocabSize,     // ditto.
@@ -50,7 +50,7 @@ Beams BeamSearch::toHyps(const std::vector<unsigned int>& nBestKeys, // [current
   std::vector<size_t> origBatchIndices;
   std::vector<size_t> oldBeamHypIndices;
   std::vector<size_t> newBeamHypIndices;
-  std::vector<std::vector<uint64_t>> flattenedLogitIndices(states.size());
+  std::vector<std::vector<uint64_t>> flattenedLogitIndices(states.size()*2);
   
   for(size_t i = 0; i < nBestKeys.size(); ++i) { // [currentDimBatch, beamSize] flattened
     // Keys encode batchIdx, beamHypIdx, and word index in the entire beam.
@@ -59,23 +59,26 @@ Beams BeamSearch::toHyps(const std::vector<unsigned int>& nBestKeys, // [current
     const auto  key = nBestKeys[i];
     
     // decompose key into individual indices (batchIdx, beamHypIdx, wordIdx)
-    const auto beamHypIdx      = (key / vocabSize) % nBestBeamSize;
-    const auto currentBatchIdx = (key / vocabSize) / nBestBeamSize;
+    const auto beamHypIdx      = ((key / vocabSize) / vocabSize) % nBestBeamSize;
+    const auto currentBatchIdx = ((key / vocabSize) / vocabSize) / nBestBeamSize;
     const auto origBatchIdx    = reverseBatchIdxMap.empty() ? currentBatchIdx : reverseBatchIdxMap[currentBatchIdx]; // map currentBatchIdx back into original position within starting maximal batch size, required to find correct beam
 
     bool dropHyp = !dropBatchEntries.empty() && dropBatchEntries[origBatchIdx] && factorGroup == 0;
     
-    WordIndex wordIdx;
+    WordIndex firstWordIdx, secondWordIdx;
     if(dropHyp) { // if we force=drop the hypothesis, assign EOS, otherwise the expected word id.
       if(factoredVocab) { // when using factoredVocab, extract the EOS lemma index from the word id, we predicting factors one by one here, hence lemma only
         std::vector<size_t> eosFactors;
         factoredVocab->word2factors(factoredVocab->getEosId(), eosFactors);
-        wordIdx = (WordIndex)eosFactors[0];
+        firstWordIdx = (WordIndex)eosFactors[0];
+        secondWordIdx = firstWordIdx;
       } else { // without factoredVocab lemma index and word index are the same. Safe cruising. 
-        wordIdx = trgVocab_->getEosId().toWordIndex();
+        firstWordIdx = trgVocab_->getEosId().toWordIndex();
+        secondWordIdx = firstWordIdx;
       }
     } else { // we are not dropping anything, just assign the normal index
-      wordIdx = (WordIndex)(key % vocabSize);
+      firstWordIdx  = (WordIndex)((key / vocabSize) % vocabSize);
+      secondWordIdx = (WordIndex)(key % vocabSize);
     }
 
     // @TODO: We currently assign a log probability of 0 to all beam entries of the dropped batch entry, instead it might be a good idea to use
@@ -98,7 +101,7 @@ Beams BeamSearch::toHyps(const std::vector<unsigned int>& nBestKeys, // [current
     // map wordIdx to word
     auto prevBeamHypIdx = beamHypIdx; // back pointer
     auto prevHyp = beam[prevBeamHypIdx];
-    Word word;
+    Word firstWord, secondWord;
     // If short list has been set, then wordIdx is an index into the short-listed word set,
     // rather than the true word index.
     auto shortlist = scorers_[0]->getShortlist();
@@ -106,8 +109,11 @@ Beams BeamSearch::toHyps(const std::vector<unsigned int>& nBestKeys, // [current
       // For factored decoding, the word is built over multiple decoding steps,
       // starting with the lemma, then adding factors one by one.
       if (factorGroup == 0) {
-        word = factoredVocab->lemma2Word(shortlist ? shortlist->reverseMap(wordIdx) : wordIdx); // @BUGBUG: reverseMap is only correct if factoredVocab_->getGroupRange(0).first == 0
-        std::vector<size_t> factorIndices; factoredVocab->word2factors(word, factorIndices);
+        firstWord = factoredVocab->lemma2Word(shortlist ? shortlist->reverseMap(firstWordIdx) : firstWordIdx); // @BUGBUG: reverseMap is only correct if factoredVocab_->getGroupRange(0).first == 0
+        secondWord = factoredVocab->lemma2Word(shortlist ? shortlist->reverseMap(secondWordIdx) : secondWordIdx); // @BUGBUG: reverseMap is only correct if factoredVocab_->getGroupRange(0).first == 0
+        std::vector<size_t> firstFactorIndices; factoredVocab->word2factors(firstWord, firstFactorIndices);
+        std::vector<size_t> secondFactorIndices; factoredVocab->word2factors(secondWord, secondFactorIndices);
+
         //LOG(info, "{} + {} ({}) -> {} -> {}",
         //    factoredVocab->decode(prevHyp->tracebackWords()),
         //    factoredVocab->word2string(word), factorIndices[0], prevHyp->getPathScore(), pathScore);
@@ -118,35 +124,42 @@ Beams BeamSearch::toHyps(const std::vector<unsigned int>& nBestKeys, // [current
         //    factoredVocab->getFactorGroupPrefix(factorGroup), factorGroup,
         //    factoredVocab->getFactorName(factorGroup, wordIdx), wordIdx,
         //    prevHyp->getPathScore(), pathScore);
-        word = beam[beamHypIdx]->getWord();
-        ABORT_IF(!factoredVocab->canExpandFactoredWord(word, factorGroup),
+        firstWord = beam[beamHypIdx]->getWord();
+        secondWord = beam[beamHypIdx]->getSecondWord();
+        ABORT_IF(!factoredVocab->canExpandFactoredWord(secondWord, factorGroup),
                   "A word without this factor snuck through to here??");
-        word = factoredVocab->expandFactoredWord(word, factorGroup, wordIdx);
+        firstWord = factoredVocab->expandFactoredWord(firstWord, factorGroup, firstWordIdx);
+        secondWord = factoredVocab->expandFactoredWord(secondWord, factorGroup, secondWordIdx);
         prevBeamHypIdx = prevHyp->getPrevStateIndex();
         prevHyp = prevHyp->getPrevHyp(); // short-circuit the backpointer, so that the traceback does not contain partially factored words
       }
     }
-    else if (shortlist)
-      word = Word::fromWordIndex(shortlist->reverseMap(wordIdx));
-    else
-      word = Word::fromWordIndex(wordIdx);
+    else if (shortlist) {
+      firstWord = Word::fromWordIndex(shortlist->reverseMap(firstWordIdx));
+      secondWord = Word::fromWordIndex(shortlist->reverseMap(secondWordIdx));
+    }
+    else {
+      firstWord = Word::fromWordIndex(firstWordIdx);
+      secondWord = Word::fromWordIndex(secondWordIdx);
+    }
 
-    auto hyp = Hypothesis::New(prevHyp, word, prevBeamHypIdx, pathScore);
+    auto hyp = Hypothesis::New(prevHyp, firstWord , secondWord, prevBeamHypIdx, pathScore);
 
     // Set score breakdown for n-best lists
     if(options_->get<bool>("n-best")) {
-      ABORT_IF(factoredVocab && factorGroup > 0 && !factoredVocab->canExpandFactoredWord(word, factorGroup),
+      ABORT_IF(factoredVocab && factorGroup > 0 && !factoredVocab->canExpandFactoredWord(secondWord, factorGroup),
                "A word without this factor snuck through to here??");
       for(uint64_t j = 0; j < states.size(); ++j) {
         auto lval = states[j]->getLogProbs().getFactoredLogitsTensor(factorGroup); // [maxBeamSize, 1, currentDimBatch, dimFactorVocab]
         // The flatting happens based on actual (current) batch size and batch index computed with batch-pruning as we are looking into the pruned tensor
-        uint64_t flattenedLogitIndex = (beamHypIdx * currentDimBatch + currentBatchIdx) * vocabSize + wordIdx;  // (beam idx, batch idx, word idx); note: beam and batch are transposed, compared to 'key'
-
+        uint64_t flattenedLogitIndex = (beamHypIdx * currentDimBatch + currentBatchIdx) * vocabSize + firstWordIdx;  // (beam idx, batch idx, word idx); note: beam and batch are transposed, compared to 'key'
+        uint64_t secondFlattenedLogitIndex = (beamHypIdx * currentDimBatch + currentBatchIdx) * vocabSize + secondWordIdx;  // (beam idx, batch idx, word idx); note: beam and batch are transposed, compared to 'key'
         // @TODO: use a function on shape() to index, or new method val->at({i1, i2, i3, i4}) with broadcasting
         ABORT_IF(lval->shape() != Shape({(int)nBestBeamSize, 1, (int)currentDimBatch, (int)vocabSize}) &&
                  (beamHypIdx == 0 && lval->shape() != Shape({1, 1, (int)currentDimBatch, (int)vocabSize})),
                  "Unexpected shape of logits?? {} != {}", lval->shape(), Shape({(int)nBestBeamSize, 1, (int)currentDimBatch, (int)vocabSize}));
         flattenedLogitIndices[j].push_back(flattenedLogitIndex);
+        flattenedLogitIndices[j].push_back(secondFlattenedLogitIndex);
       }
       newBeamHypIndices.push_back(newBeam.size());
       origBatchIndices.push_back(origBatchIdx);
@@ -171,21 +184,21 @@ Beams BeamSearch::toHyps(const std::vector<unsigned int>& nBestKeys, // [current
     std::vector<float> logits(flattenedLogitIndices[0].size());
 
     for(size_t state = 0; state < states.size(); ++state) {
-      auto lval = states[state]->getLogProbs().getFactoredLogitsTensor(factorGroup); // [maxBeamSize, 1, currentDimBatch, dimFactorVocab]
+      auto lval = states[state]->getLogProbs().getFactoredLogitsTensor(factorGroup); // [maxBeamSize, 2, currentDimBatch, dimFactorVocab]
       indices->set(flattenedLogitIndices[state]); 
       lval->gatherFromIndices(logitsTensor, indices);
       logitsTensor->get(logits);
 
       for(int i = 0; i < flattenedLogitIndices[state].size(); ++i) {
-        const auto originalBatchIdx = origBatchIndices[i];
-        const auto beamHypIdx = oldBeamHypIndices[i];
+        const auto originalBatchIdx = origBatchIndices[i/2];
+        const auto beamHypIdx = oldBeamHypIndices[i/2];
         const auto& beam = beams[originalBatchIdx];
         auto& newBeam = newBeams[originalBatchIdx];
 
         auto breakDown = beam[beamHypIdx]->getScoreBreakdown(); 
         breakDown.resize(states.size(), 0); // at start, this is empty, so this will set the initial score to 0
         breakDown[state] += logits[i];
-        newBeam[newBeamHypIndices[i]]->setScoreBreakdown(breakDown);
+        newBeam[newBeamHypIndices[i/2]]->setScoreBreakdown(breakDown);
       }
     }
     allocator_->free(indices);
@@ -195,6 +208,7 @@ Beams BeamSearch::toHyps(const std::vector<unsigned int>& nBestKeys, // [current
   // if factored vocab and this is not the first factor, we need to
   // also propagate factored hypotheses that do not get expanded in this step because they don't have this factor
   if (factorGroup > 0) {
+    ABORT("not supported!");
     for (size_t batchIdx = 0; batchIdx < beams.size(); batchIdx++) {
       const auto& beam = beams[batchIdx];
       auto& newBeam = newBeams[batchIdx];
@@ -272,7 +286,7 @@ Beams BeamSearch::purgeBeams(const Beams& beams, /*in/out=*/std::vector<IndexTyp
   for(auto beam : beams) {
     Beam newBeam; // a beam of surviving hyps
     for(auto hyp : beam)
-      if(hyp->getWord() != trgEosId) // if this hyp is not finished,
+      if(hyp->getSecondWord() != trgEosId && hyp->getWord() != trgEosId) // if this hyp is not finished,
         newBeam.push_back(hyp);      // move over to beam of surviving hyps
 
     if(PURGE_BATCH)
@@ -301,7 +315,7 @@ Histories BeamSearch::search(Ptr<ExpressionGraph> graph, Ptr<data::CorpusBatch> 
   const auto trgEosId = trgVocab_->getEosId();
   const auto trgUnkId = trgVocab_->getUnkId();
 
-  auto getNBestList = createGetNBestListFn(beamSize_, origDimBatch, graph->getDeviceId());
+  auto getNBestList = createGetNBestListFn(beamSize_, origDimBatch*2*beamSize_, graph->getDeviceId());
   allocator_ = graph->getTensorAllocator();
 
   for(auto scorer : scorers_) {
@@ -409,9 +423,7 @@ Histories BeamSearch::search(Ptr<ExpressionGraph> graph, Ptr<data::CorpusBatch> 
             auto& beam = beams[origBatchIdx];
             if(beamHypIdx < beam.size()) {
               auto hyp = beam[beamHypIdx];
-              auto prevHyp = hyp->getPrevHyp();
-              auto word = hyp->getWord();
-              auto canExpand = (!factoredVocab || factoredVocab->canExpandFactoredWord(hyp->getWord(), factorGroup));
+              auto canExpand = (!factoredVocab || factoredVocab->canExpandFactoredWord(hyp->getSecondWord(), factorGroup));
               //LOG(info, "[{}, {}] Can expand {} with {} -> {}", batchIdx, beamHypIdx, (*batch->back()->vocab())[hyp->getWord()], factorGroup, canExpand);
               anyCanExpand |= canExpand;
 
@@ -425,11 +437,11 @@ Histories BeamSearch::search(Ptr<ExpressionGraph> graph, Ptr<data::CorpusBatch> 
                                                                    // happened for factorGroup == 0
               }
 
-              auto hypIndex = (IndexType)(prevHyp->getPrevStateIndex() * currentDimBatch + currentBatchIdx); // (beamHypIdx, batchIdx), flattened, for index_select() operation
+              auto hypIndex = (IndexType)(hyp->getPrevStateIndex() * currentDimBatch + currentBatchIdx); // (beamHypIdx, batchIdx), flattened, for index_select() operation
 
               hypIndices.push_back(hypIndex); // (beamHypIdx, batchIdx), flattened as said above.
-              prevWords.push_back(prevHyp->getWord());
-              prevWords .push_back(word);
+              prevWords.push_back(hyp->getWord());
+              prevWords .push_back(hyp->getSecondWord());
               prevScores.push_back(canExpand ? hyp->getPathScore() : INVALID_PATH_SCORE);
             } else {  // pad to maxBeamSize (dummy hypothesis)
               if(!PURGE_BATCH || !beam.empty()) { // but only if we are not pruning and the beam is not deactivated yet
@@ -452,62 +464,47 @@ Histories BeamSearch::search(Ptr<ExpressionGraph> graph, Ptr<data::CorpusBatch> 
       //**********************************************************************
       // compute expanded path scores with word prediction probs from all scorers
       //   auto expandedPathScores = prevPathScores; // will become [maxBeamSize, 1, currDimBatch, dimVocab]
-      Expr stepExpandedScores;
-      std::vector<IndexType> stepIdx(1);
-      if(t % 2 == 0) {
-        expandedScores = graph->constant({1, 1, 1, 1}, inits::fromValue(0));
-        Expr logProbs;
-        for(size_t i = 0; i < scorers_.size(); ++i) {
-            if (factorGroup == 0) {
-            // compute output probabilities for current output time step
-            //  - uses hypIndices[index in beam, 1, batch index, 1] to reorder scorer state to reflect the top-N in beams[][]
-            //  - adds prevWords [index in beam, 1, batch index, 1] to the scorer's target history
-            //  - performs one step of the scorer
-            //  - returns new NN state for use in next output time step
-            //  - returns vector of prediction probabilities over output vocab via newState
-            // update state in-place for next output time step
-            //if (t > 0) for (size_t kk = 0; kk < prevWords.size(); kk++)
-            //  LOG(info, "prevWords[{},{}]={} -> {}", t/numFactorGroups, factorGroup,
-            //      factoredVocab ? factoredVocab->word2string(prevWords[kk]) : (*batch->back()->vocab())[prevWords[kk]],
-            //      prevScores[kk]);
-            states[i] = scorers_[i]->step(graph, states[i], hypIndices, prevWords, batchIndices, (int)maxBeamSize);
-            if (numFactorGroups == 1) // @TODO: this branch can go away
-                logProbs = states[i]->getLogProbs().getLogits(); // [maxBeamSize, 1, currentDimBatch, dimVocab]
-            else
-            {
-                auto shortlist = scorers_[i]->getShortlist();
-                logProbs = states[i]->getLogProbs().getFactoredLogits(factorGroup, shortlist); // [maxBeamSize, 1, currentDimBatch, dimVocab]
-            }
-            }
-            else {
-            // add secondary factors
-            // For those, we don't update the decoder-model state in any way.
-            // Instead, we just keep expanding with the factors.
-            // We will have temporary Word entries in hyps with some factors set to FACTOR_NOT_SPECIFIED.
-            // For some lemmas, a factor is not applicable. For those, the factor score is the same (zero)
-            // for all factor values. This would thus unnecessarily pollute the beam with identical copies,
-            // and push out other hypotheses. Hence, we exclude those here by setting the path score to
-            // INVALID_PATH_SCORE. Instead, toHyps() explicitly propagates those hyps by simply copying the
-            // previous hypothesis.
-            logProbs = states[i]->getLogProbs().getFactoredLogits(factorGroup, /*shortlist=*/ nullptr, hypIndices, maxBeamSize); // [maxBeamSize, 1, currentDimBatch, dimVocab]
-            }
-            // expand all hypotheses, [maxBeamSize, 1, currentDimBatch, 1] -> [maxBeamSize, 2, currentDimBatch, dimVocab]
-            expandedScores = expandedScores + scorers_[i]->getWeight() * logProbs;
-        }
-        stepIdx[0] = 0;
-        stepExpandedScores = index_select(expandedScores, 1, stepIdx);
-      } else {
-        stepIdx[0] = 1;
-        stepExpandedScores = index_select(expandedScores, 1, stepIdx);
-        auto sesShape = stepExpandedScores->shape();
-        // indexing again
-        stepExpandedScores = reshape(stepExpandedScores, {(int)(sesShape.elements()/sesShape[-1]), (int)sesShape[-1]});
-        stepExpandedScores = index_select(stepExpandedScores, 0, hypIndices);
-        stepExpandedScores = reshape(stepExpandedScores, {(int)maxBeamSize, 1, (int)currentDimBatch, (int)sesShape[-1]});
+      expandedScores = graph->constant({1, 1, 1, 1}, inits::fromValue(0));
+      Expr logProbs;
+      for(size_t i = 0; i < scorers_.size(); ++i) {
+          if (factorGroup == 0) {
+          // compute output probabilities for current output time step
+          //  - uses hypIndices[index in beam, 1, batch index, 1] to reorder scorer state to reflect the top-N in beams[][]
+          //  - adds prevWords [index in beam, 1, batch index, 1] to the scorer's target history
+          //  - performs one step of the scorer
+          //  - returns new NN state for use in next output time step
+          //  - returns vector of prediction probabilities over output vocab via newState
+          // update state in-place for next output time step
+          //if (t > 0) for (size_t kk = 0; kk < prevWords.size(); kk++)
+          //  LOG(info, "prevWords[{},{}]={} -> {}", t/numFactorGroups, factorGroup,
+          //      factoredVocab ? factoredVocab->word2string(prevWords[kk]) : (*batch->back()->vocab())[prevWords[kk]],
+          //      prevScores[kk]);
+          states[i] = scorers_[i]->step(graph, states[i], hypIndices, prevWords, batchIndices, (int)maxBeamSize);
+          if (numFactorGroups == 1) // @TODO: this branch can go away
+              logProbs = states[i]->getLogProbs().getLogits(); // [maxBeamSize, 1, currentDimBatch, dimVocab]
+          else
+          {
+              auto shortlist = scorers_[i]->getShortlist();
+              logProbs = states[i]->getLogProbs().getFactoredLogits(factorGroup, shortlist); // [maxBeamSize, 1, currentDimBatch, dimVocab]
+          }
+          }
+          else {
+          // add secondary factors
+          // For those, we don't update the decoder-model state in any way.
+          // Instead, we just keep expanding with the factors.
+          // We will have temporary Word entries in hyps with some factors set to FACTOR_NOT_SPECIFIED.
+          // For some lemmas, a factor is not applicable. For those, the factor score is the same (zero)
+          // for all factor values. This would thus unnecessarily pollute the beam with identical copies,
+          // and push out other hypotheses. Hence, we exclude those here by setting the path score to
+          // INVALID_PATH_SCORE. Instead, toHyps() explicitly propagates those hyps by simply copying the
+          // previous hypothesis.
+          logProbs = states[i]->getLogProbs().getFactoredLogits(factorGroup, /*shortlist=*/ nullptr, hypIndices, maxBeamSize); // [maxBeamSize, 1, currentDimBatch, dimVocab]
+          }
+          // expand all hypotheses, [maxBeamSize, 1, currentDimBatch, 1] -> [maxBeamSize, 2, currentDimBatch, dimVocab]
+          expandedScores = expandedScores + scorers_[i]->getWeight() * logProbs;
       }
-      
-      // make beams continuous
-      auto expandedPathScores = swapAxes(prevPathScores + stepExpandedScores, 0, 2); // -> [currentDimBatch, 1, maxBeamSize, dimVocab]
+      // IBDecoder: there will be two words predicted outside
+      expandedScores = swapAxes(expandedScores, 0, 2); // -> [currentDimBatch, 2, maxBeamSize, dimVocab]
 
       // perform NN computation
       if(t == 0 && factorGroup == 0)
@@ -518,9 +515,62 @@ Histories BeamSearch::search(Ptr<ExpressionGraph> graph, Ptr<data::CorpusBatch> 
       //**********************************************************************
       // suppress specific symbols if not at right positions
       if(unkColId != -1 && factorGroup == 0)
-        suppressWord(expandedPathScores, unkColId);
+        suppressWord(expandedScores, unkColId);
       for(auto state : states)
-        state->blacklist(expandedPathScores, batch);
+        state->blacklist(expandedScores, batch);
+
+      // IBDecoder: extract topN predictions for each word
+      auto epsShape = expandedScores->shape();
+      // Note here we first compress the prediction for each word independently to reduce the search space and 
+      // hopefully increase running efficiency
+      expandedScores = reshape(expandedScores, {epsShape[-4]*2*epsShape[-2], 1, 1, epsShape[-1]});
+      size_t topN = maxBeamSize;
+      size_t actualBeamSize = epsShape[-2], vocabSize = epsShape[-1];
+
+      std::vector<unsigned int> nBestLocalKeys; // [currentDimBatch, 2, maxBeamSize, topN] flattened -> (batchIdx*2, beamHypIdx, word idx) flattened
+      std::vector<float> nBestLocalScores;  // [currentDimBatch, 2, maxBeamSize, topN] flattened
+      getNBestList(/*in*/   expandedScores->val(),  // [currentDimBatch*2*actualBeamSize, 1, 1, dimVocab or dimShortlist]
+                   /*N=*/   topN,                   // topK prediction
+                   /*out*/  nBestLocalScores,
+                   /*out*/  nBestLocalKeys,
+                   /*first*/true                    // the beam size dimension is always 1 so set the first flag to true
+      );
+      auto nBestLocalTopNScores = graph->constant(
+        {(int)currentDimBatch, 2, (int)actualBeamSize, (int)topN}, inits::fromVector(nBestLocalScores));
+
+      // [currentDimBatch, actualBeamSize, 1, topN]
+      auto firstWordTopNScores  = swapAxes(index_select(nBestLocalTopNScores, 1, std::vector<IndexType>(1, 0)), 1, 2);
+      auto secondWordTopNScores = swapAxes(index_select(nBestLocalTopNScores, 1, std::vector<IndexType>(1, 1)), 1, 2);
+      // [currentDimBatch, actualBeamSize, TopN1, TopN2]
+      auto localTopNScores      = swapAxes(firstWordTopNScores, 2, 3) + secondWordTopNScores;
+      localTopNScores           = reshape(localTopNScores, {(int)(localTopNScores->shape().elements()/(topN*topN)), 1, 1, (int)(topN*topN)});
+
+      // perform NN computation
+      if(t == 0 && factorGroup == 0)
+        graph->forward();
+      else
+        graph->forwardNext();
+
+      std::vector<unsigned int> nBestPairKeys; // [currentDimBatch, maxBeamSize] flattened -> (batchIdx, word1 topn index, word2 topn idx) flattened
+      std::vector<float> nBestPairScores;  // [currentDimBatch, maxBeamSize] flattened
+      getNBestList(/*in*/   localTopNScores->val(),  // [currentDimBatch*actualBeamSize, 1, 1, topN*topN]
+                   /*N=*/   topN,                    // topK prediction
+                   /*out*/  nBestPairScores,
+                   /*out*/  nBestPairKeys,
+                   /*first*/true                    // the beam size dimension is always 1 so set the first flag to true
+      );
+      auto nBestPairTopNScores = graph->constant(
+        {(int)currentDimBatch, 1, (int)actualBeamSize, (int)topN}, inits::fromVector(nBestPairScores));
+      
+      // make beams continuous
+      auto expandedPathScores = swapAxes(prevPathScores, 0, 2); // -> [currentDimBatch, 1, maxBeamSize, topN]
+      expandedPathScores = expandedPathScores + nBestPairTopNScores;
+
+      // perform NN computation
+      if(t == 0 && factorGroup == 0)
+        graph->forward();
+      else
+        graph->forwardNext();
 
       //**********************************************************************
       // perform beam search
@@ -528,7 +578,7 @@ Histories BeamSearch::search(Ptr<ExpressionGraph> graph, Ptr<data::CorpusBatch> 
       // find N best amongst the (maxBeamSize * dimVocab) hypotheses
       std::vector<unsigned int> nBestKeys; // [currentDimBatch, maxBeamSize] flattened -> (batchIdx, beamHypIdx, word idx) flattened
       std::vector<float> nBestPathScores;  // [currentDimBatch, maxBeamSize] flattened
-      getNBestList(/*in*/   expandedPathScores->val(),   // [currentDimBatch, 1, maxBeamSize, dimVocab or dimShortlist]
+      getNBestList(/*in*/   expandedPathScores->val(),   // [currentDimBatch, 1, maxBeamSize, topN]
                   /*N=*/    maxBeamSize,                 // desired beam size
                   /*out*/   nBestPathScores,
                    /*out*/  nBestKeys,
@@ -536,10 +586,63 @@ Histories BeamSearch::search(Ptr<ExpressionGraph> graph, Ptr<data::CorpusBatch> 
       // Now, nBestPathScores contain N-best expandedPathScores for each batch and beam,
       // and nBestKeys for each their original location (batchIdx, beamHypIdx, word).
 
+      // IBDecoder: update nBestKey to extract the vocabulary information
+      std::vector<uint64_t> nNewBestKeys;
+      for(size_t i = 0; i < nBestKeys.size(); ++i) { // [currentDimBatch, maxBeamSize] flattened
+        const auto  key = nBestKeys[i];
+        
+        // decompose key into individual indices (batchIdx, beamHypIdx, wordIdx)
+        const auto beamHypIdx      = (key / topN) % actualBeamSize;
+        const auto currentBatchIdx = (key / topN) / actualBeamSize;
+        // const auto predIdx         = (key % topN);
+
+        // backtrace the pair information
+        // [currentDimBatch*actualBeamSize, 1, 1, topN*topN]
+        const auto pairKey = nBestPairKeys[key];
+        const auto topNSquare = topN * topN;
+
+        // decompose key into individual indices
+        const auto pairBeamHypIdx       = (pairKey / topNSquare) % actualBeamSize;
+        const auto pairCurrentBatchIdx  = (pairKey / topNSquare) / actualBeamSize;
+        const auto pairPredIdx          = (pairKey % topNSquare);
+
+        ABORT_IF(beamHypIdx != pairBeamHypIdx, "Beam hypothesis index should be the same");
+        ABORT_IF(currentBatchIdx != pairCurrentBatchIdx, "Batch index should also be the same");
+
+        // backtrace the actual word information
+        const auto firstWordPredIdx     = (pairPredIdx / topN);
+        const auto secondWordPredIdx    = (pairPredIdx % topN);
+
+        const auto firstWordLocalIdx    = currentBatchIdx * (2*actualBeamSize*topN) + 0 * (actualBeamSize*topN) + beamHypIdx * (topN) + firstWordPredIdx;
+        const auto secondWordLocalIdx   = currentBatchIdx * (2*actualBeamSize*topN) + 1 * (actualBeamSize*topN) + beamHypIdx * (topN) + secondWordPredIdx;
+
+        // encode the word information
+        const auto firstWordKey  = nBestLocalKeys[firstWordLocalIdx ];
+        const auto secondWordKey = nBestLocalKeys[secondWordLocalIdx];  
+        const auto firstWord     = nBestLocalKeys[firstWordLocalIdx ] % vocabSize;
+        const auto secondWord    = nBestLocalKeys[secondWordLocalIdx] % vocabSize;
+
+        // {(int)currentDimBatch, 2, (int)actualBeamSize, (int)vocab}
+        const auto firstWordBeamHypIdx    = (firstWordKey  / vocabSize) % actualBeamSize;
+        const auto firstWordBatchIdx      = (firstWordKey  / vocabSize)  / actualBeamSize / 2;
+        const auto secondWordBeamHypIdx   = (secondWordKey / vocabSize) % actualBeamSize;
+        const auto secondWordBatchIdx     = (secondWordKey / vocabSize)  / actualBeamSize / 2;
+
+        ABORT_IF(beamHypIdx != firstWordBeamHypIdx, "First Word Beam hypothesis index should be the same");
+        ABORT_IF(currentBatchIdx != firstWordBatchIdx, "First word Batch index should also be the same");
+        ABORT_IF(beamHypIdx != secondWordBeamHypIdx, "Second Word Beam hypothesis index should be the same");
+        ABORT_IF(currentBatchIdx != secondWordBatchIdx, "Second word Batch index should also be the same");
+
+        // [currentDimBatch, maxBeamSize, vocabSize, vocabSize]
+        // nBestKeys[i] = currentBatchIdx * (actualBeamSize*vocabSize*vocabSize) + beamHypIdx * (vocabSize*vocabSize) + firstWord * (vocabSize) + secondWord;
+        const uint64_t newKey = currentBatchIdx * (actualBeamSize*vocabSize*vocabSize) + beamHypIdx * (vocabSize*vocabSize) + firstWord * (vocabSize) + secondWord;
+        nNewBestKeys.push_back(newKey);
+      }
+
       // combine N-best sets with existing search space (beams) to updated search space
-      beams = toHyps(nBestKeys, nBestPathScores,
-                     /*nBestBeamSize*/expandedPathScores->shape()[-2], // used for interpretation of keys
-                     /*vocabSize=*/expandedPathScores->shape()[-1],    // used for interpretation of keys
+      beams = toHyps(nNewBestKeys, nBestPathScores,
+                     /*nBestBeamSize*/actualBeamSize, // used for interpretation of keys
+                     /*vocabSize=*/vocabSize,    // used for interpretation of keys
                      beams,
                      states,            // used for keeping track of per-ensemble-member path score
                      batch,             // only used for propagating alignment info
