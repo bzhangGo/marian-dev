@@ -16,6 +16,7 @@ std::vector<Ptr<ValidatorBase/*<data::Corpus>*/>> Validators(
     if(std::find(ceMetrics.begin(), ceMetrics.end(), metric) != ceMetrics.end()) {
       Ptr<Options> opts = New<Options>(*config);
       opts->set("cost-type", metric);
+      opts->set("inference", false);
 
       auto validator = New<CrossEntropyValidator>(vocabs, opts);
       validators.push_back(validator);

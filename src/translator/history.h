@@ -22,7 +22,7 @@ private:
   float lengthPenalty(size_t length) { return std::pow((float)length, alpha_); }
   float wordPenalty(size_t length) { return wp_ * (float)length; }
 public:
-  History(size_t lineNo, float alpha = 1.f, float wp_ = 0.f);
+  History(size_t lineNo, Word eosId, float alpha = 1.f, float wp_ = 0.f);
 
   void add(const Beam& beam, Word trgEosId, bool last = false) {
     if(beam.back()->getPrevHyp() != nullptr) { // if not start hyp do
@@ -59,6 +59,22 @@ public:
       Words targetWords = bestHyp->tracebackWords();
       if (skipEmpty && targetWords.size() == 0)
         continue; // skip empty translation
+      
+      // IBDecoder: reorder the generated words
+      Words newWords; size_t wSize = 0;
+      while(wSize < targetWords.size()){
+        if(targetWords[wSize] == eosId_)
+          break;
+        wSize += 1;
+      }
+      for(int j = 0; j < wSize; j += 2)
+        newWords.push_back(targetWords[j]);
+      for(int j = wSize - 1 - wSize % 2; j >= 0; j -= 2)
+        newWords.push_back(targetWords[j]);
+      if(wSize < targetWords.size()-1)
+        newWords.push_back(eosId_);
+      targetWords = newWords;
+      
       // note: bestHyp->getPathScore() is not normalized, while bestHypCoord.normalizedPathScore is
       nbest.emplace_back(targetWords, bestHyp, bestHypCoord.normalizedPathScore);
     }
@@ -79,6 +95,7 @@ private:
   size_t lineNo_;
   float alpha_;
   float wp_;
+  Word eosId_;
 };
 
 typedef std::vector<Ptr<History>> Histories; // [batchDim]

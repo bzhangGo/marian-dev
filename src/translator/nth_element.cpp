@@ -32,7 +32,7 @@ public:
     const auto dimBatch  = scores->shape()[-4];
     ABORT_IF(inputN != (isFirst ? 1 : N), "Input tensor has wrong beam dim??"); // @TODO: Remove isFirst argument altogether
     const float* scoresData = scores->data();
-
+    
     size_t maxSize = N * dimBatch;
     h_res.resize(maxSize);
     h_res_idx.resize(maxSize);
