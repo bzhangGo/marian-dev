@@ -150,10 +150,10 @@ Beams BeamSearch::toHyps(const std::vector<uint64_t>& nBestKeys, // [currentDimB
       ABORT_IF(factoredVocab && factorGroup > 0 && !factoredVocab->canExpandFactoredWord(secondWord, factorGroup),
                "A word without this factor snuck through to here??");
       for(uint64_t j = 0; j < states.size(); ++j) {
-        auto lval = states[j]->getLogProbs().getFactoredLogitsTensor(factorGroup); // [maxBeamSize, 1, currentDimBatch, dimFactorVocab]
+        auto lval = states[j]->getLogProbs().getFactoredLogitsTensor(factorGroup); // [maxBeamSize, 2, currentDimBatch, dimFactorVocab]
         // The flatting happens based on actual (current) batch size and batch index computed with batch-pruning as we are looking into the pruned tensor
-        uint64_t flattenedLogitIndex = (beamHypIdx * currentDimBatch + currentBatchIdx) * vocabSize + firstWordIdx;  // (beam idx, batch idx, word idx); note: beam and batch are transposed, compared to 'key'
-        uint64_t secondFlattenedLogitIndex = (beamHypIdx * currentDimBatch + currentBatchIdx) * vocabSize + secondWordIdx;  // (beam idx, batch idx, word idx); note: beam and batch are transposed, compared to 'key'
+        uint64_t flattenedLogitIndex = beamHypIdx * (2*currentDimBatch*vocabSize) + 0 * (currentDimBatch*vocabSize) + currentBatchIdx*vocabSize + firstWordIdx;
+        uint64_t secondFlattenedLogitIndex = beamHypIdx * (2*currentDimBatch*vocabSize) + 1 * (currentDimBatch*vocabSize) + currentBatchIdx*vocabSize + secondWordIdx;;  // (beam idx, batch idx, word idx); note: beam and batch are transposed, compared to 'key'
         // @TODO: use a function on shape() to index, or new method val->at({i1, i2, i3, i4}) with broadcasting
         ABORT_IF(lval->shape() != Shape({(int)nBestBeamSize, 1, (int)currentDimBatch, (int)vocabSize}) &&
                  (beamHypIdx == 0 && lval->shape() != Shape({1, 1, (int)currentDimBatch, (int)vocabSize})),
@@ -208,7 +208,7 @@ Beams BeamSearch::toHyps(const std::vector<uint64_t>& nBestKeys, // [currentDimB
   // if factored vocab and this is not the first factor, we need to
   // also propagate factored hypotheses that do not get expanded in this step because they don't have this factor
   if (factorGroup > 0) {
-    ABORT("not supported!");
+    ABORT("not supported! note IBDecoder doesn't support factored models!");
     for (size_t batchIdx = 0; batchIdx < beams.size(); batchIdx++) {
       const auto& beam = beams[batchIdx];
       auto& newBeam = newBeams[batchIdx];
