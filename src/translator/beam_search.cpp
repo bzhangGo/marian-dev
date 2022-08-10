@@ -538,11 +538,12 @@ Histories BeamSearch::search(Ptr<ExpressionGraph> graph, Ptr<data::CorpusBatch> 
       auto nBestLocalTopNScores = graph->constant(
         {(int)currentDimBatch, 2, (int)actualBeamSize, (int)topN}, inits::fromVector(nBestLocalScores));
 
+      // [currentDimBatch, actualBeamSize, topN, 1]
+      auto firstWordTopNScores  = transpose(index_select(nBestLocalTopNScores, 1, std::vector<IndexType>(1, 0)), {0,2,3,1});
       // [currentDimBatch, actualBeamSize, 1, topN]
-      auto firstWordTopNScores  = swapAxes(index_select(nBestLocalTopNScores, 1, std::vector<IndexType>(1, 0)), 1, 2);
       auto secondWordTopNScores = swapAxes(index_select(nBestLocalTopNScores, 1, std::vector<IndexType>(1, 1)), 1, 2);
       // [currentDimBatch, actualBeamSize, TopN1, TopN2]
-      auto localTopNScores      = swapAxes(firstWordTopNScores, 2, 3) + secondWordTopNScores;
+      auto localTopNScores      = firstWordTopNScores + secondWordTopNScores;
       localTopNScores           = reshape(localTopNScores, {(int)(localTopNScores->shape().elements()/(topN*topN)), 1, 1, (int)(topN*topN)});
 
       // perform NN computation
