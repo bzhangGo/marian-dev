@@ -407,6 +407,27 @@ void CorpusBase::addWordsToSentenceTuple(const std::string& line,
   if(rightLeft_)
     std::reverse(words.begin(), words.end() - 1);
 
+  // IBDecoder: interleave target sequence during training
+  // The rule is: A B C D -> A D B C
+  //              A B C D E -> A E B D C
+  auto scoring_ = options_->get<bool>("scoring", false);
+  if((scoring_ || !inference_) && batchIndex == 1) {  // during training and for the target stream
+    auto numWords = words.size();
+    Words newWords;
+    LOG_ONCE(info, "[data] Applying interleave operation to Stream {}", batchIndex);
+
+    // Note if EOS is added to the sequence, skip it when performing interleaving
+    size_t offset = 1 + addEOS_[batchIndex];
+    for(size_t i = 0, j = numWords-offset; i <= j; ++i, --j) {
+      newWords.push_back(words[i]);
+      if(i < j)
+        newWords.push_back(words[j]);
+    }
+    if(addEOS_[batchIndex])
+      newWords.push_back(vocabs_[batchIndex]->getEosId());
+    words = newWords;
+  }
+
   tup.push_back(words);
 }
 

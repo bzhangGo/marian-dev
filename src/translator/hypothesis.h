@@ -18,13 +18,14 @@ public:
 private:
   // Constructors are private, use Hypothesis::New(...)
 
-  Hypothesis() : prevHyp_(nullptr), prevBeamHypIdx_(0), word_(Word::ZERO), pathScore_(0.0) {}
+  Hypothesis() : prevHyp_(nullptr), prevBeamHypIdx_(0), word_(Word::ZERO), secondWord_(Word::ZERO), pathScore_(0.0) {}
 
   Hypothesis(const PtrType prevHyp,
              Word word,
+             Word secondWord,
              size_t prevBeamHypIdx, // beam-hyp index that this hypothesis originated from
              float pathScore)
-      : prevHyp_(prevHyp), prevBeamHypIdx_(prevBeamHypIdx), word_(word), pathScore_(pathScore) {}
+      : prevHyp_(prevHyp), prevBeamHypIdx_(prevBeamHypIdx), word_(word), secondWord_(secondWord), pathScore_(pathScore) {}
 
 public:
  // Use this whenever creating a pointer to MemoryPiece
@@ -36,7 +37,9 @@ public:
   const PtrType getPrevHyp() const { return prevHyp_; }
 
   Word getWord() const { return word_; }
-
+  
+  Word getSecondWord() const { return secondWord_; }
+  
   size_t getPrevStateIndex() const { return prevBeamHypIdx_; }
 
   float getPathScore() const { return pathScore_; }
@@ -51,6 +54,7 @@ public:
   Words tracebackWords() {
     Words targetWords;
     for(auto hyp = this; hyp->getPrevHyp(); hyp = hyp->getPrevHyp().get()) {
+      targetWords.push_back(hyp->getSecondWord());
       targetWords.push_back(hyp->getWord());
     }
     std::reverse(targetWords.begin(), targetWords.end());
@@ -86,6 +90,7 @@ private:
   const PtrType prevHyp_;
   const size_t prevBeamHypIdx_;
   const Word word_;
+  const Word secondWord_;
   const float pathScore_;
 
   std::vector<float> scoreBreakdown_; // [num scorers]
