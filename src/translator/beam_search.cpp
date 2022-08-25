@@ -317,7 +317,6 @@ Histories BeamSearch::search(Ptr<ExpressionGraph> graph, Ptr<data::CorpusBatch> 
   // We will use the prefix "currentBatch.." whenever we refer to batch dimension that can change due to batch-pruning.
   const int origDimBatch = (int)batch->size();
   const auto trgEosId = trgVocab_->getEosId();
-  const auto trgUnkId = trgVocab_->getUnkId();
 
   auto getNBestList = createGetNBestListFn(beamSize_, origDimBatch*2*beamSize_, graph->getDeviceId());
   allocator_ = graph->getTensorAllocator();
