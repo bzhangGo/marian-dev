@@ -47,7 +47,8 @@ public:
 
     ABORT_IF(shortlist_, "How did a shortlist make it into training?");
 
-    auto yDelayed = shift(y, {1, 0, 0}); // insert zero at front; first word gets predicted from a target embedding of 0
+    // IBDecoder: shiting by 2 rather than 1
+    auto yDelayed = shift(y, {2, 0, 0}); // insert zero at front; first word gets predicted from a target embedding of 0
 
     state->setTargetHistoryEmbeddings(yDelayed);
     state->setTargetMask(yMask);
@@ -65,10 +66,14 @@ public:
     auto embeddingLayer = getEmbeddingLayer();
     Expr selectedEmbs;
     int dimEmb = opt<int>("dim-emb");
+    // IBDecoder: one word prediction to two words prediction
     if(words.empty())
-      selectedEmbs = graph_->constant({1, 1, dimBatch, dimEmb}, inits::zeros());
-    else
-      selectedEmbs = embeddingLayer->apply(words, {dimBeam, 1, dimBatch, dimEmb});
+      selectedEmbs = graph_->constant({1, 2, dimBatch, dimEmb}, inits::zeros());
+    else {
+      selectedEmbs = embeddingLayer->apply(words, {dimBeam, dimBatch, 2, dimEmb});
+      // IBDecoder: reorder the shaping
+      selectedEmbs = swapAxes(selectedEmbs, 1, 2);  // [dimBeam, 2, dimBatch, dimEmb]
+    }
     state->setTargetHistoryEmbeddings(selectedEmbs);
   }
 

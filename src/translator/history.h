@@ -22,13 +22,13 @@ private:
   float lengthPenalty(size_t length) { return std::pow((float)length, alpha_); }
   float wordPenalty(size_t length) { return wp_ * (float)length; }
 public:
-  History(size_t lineNo, float alpha = 1.f, float wp_ = 0.f);
+  History(size_t lineNo, Word eosId, float alpha = 1.f, float wp_ = 0.f);
 
   void add(const Beam& beam, Word trgEosId, bool last = false) {
     if(beam.back()->getPrevHyp() != nullptr) { // if not start hyp do
       for(size_t beamIdx = 0; beamIdx < beam.size(); ++beamIdx)
-        if(beam[beamIdx]->getWord() == trgEosId || last) { // if this is a final hyp do
-          float pathScore = (beam[beamIdx]->getPathScore() - wordPenalty(history_.size())) / lengthPenalty(history_.size()); // get and normalize path score
+        if(beam[beamIdx]->getWord() == trgEosId || beam[beamIdx]->getSecondWord() == trgEosId || last) { // if this is a final hyp do
+          float pathScore = (beam[beamIdx]->getPathScore() - wordPenalty(history_.size()*2)) / lengthPenalty(history_.size()*2); // get and normalize path score
           topHyps_.push({history_.size(), beamIdx, pathScore}); // push final hyp on queue of scored hyps
         }
     }
@@ -58,6 +58,22 @@ public:
       Words targetWords = bestHyp->tracebackWords();
       if (skipEmpty && targetWords.size() == 0)
         continue; // skip empty translation
+
+      // IBDecoder: reorder the generated words
+      Words newWords; size_t wSize = 0;
+      while(wSize < targetWords.size()){
+        if(targetWords[wSize] == eosId_)
+          break;
+        wSize += 1;
+      }
+      for(int j = 0; j < wSize; j += 2)
+        newWords.push_back(targetWords[j]);
+      for(int j = wSize - 1 - wSize % 2; j >= 0; j -= 2)
+        newWords.push_back(targetWords[j]);
+      if(wSize < targetWords.size()-1)
+        newWords.push_back(eosId_);
+      targetWords = newWords;
+
       // note: bestHyp->getPathScore() is not normalized, while bestHypCoord.normalizedPathScore is
       nbest.emplace_back(targetWords, bestHyp, bestHypCoord.normalizedPathScore);
     }
@@ -76,6 +92,7 @@ private:
   std::vector<Beam> history_; // [time step][index into beam] search grid @TODO: simplify as this is currently an expensive length count
   std::priority_queue<SentenceHypothesisCoord> topHyps_; // all sentence hypotheses (those that reached eos), sorted by score
   size_t lineNo_;
+  const Word eosId_;
   float alpha_;
   float wp_;
 };
