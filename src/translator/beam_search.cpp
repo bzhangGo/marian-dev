@@ -97,8 +97,8 @@ Beams BeamSearch::toHyps(const std::vector<uint64_t>& nBestKeys, // [currentDimB
       // For factored decoding, the word is built over multiple decoding steps,
       // starting with the lemma, then adding factors one by one.
       if (factorGroup == 0) {
-        firstWord = factoredVocab->lemma2Word(shortlist ? shortlist->reverseMap(firstWordIdx) : firstWordIdx); // @BUGBUG: reverseMap is only correct if factoredVocab_->getGroupRange(0).first == 0
-        secondWord = factoredVocab->lemma2Word(shortlist ? shortlist->reverseMap(secondWordIdx) : secondWordIdx); // @BUGBUG: reverseMap is only correct if factoredVocab_->getGroupRange(0).first == 0
+        firstWord = factoredVocab->lemma2Word(shortlist ? shortlist->reverseMap((int) prevBeamHypIdx, (int) currentBatchIdx, firstWordIdx) : firstWordIdx); // @BUGBUG: reverseMap is only correct if factoredVocab_->getGroupRange(0).first == 0
+        secondWord = factoredVocab->lemma2Word(shortlist ? shortlist->reverseMap((int) prevBeamHypIdx, (int) currentBatchIdx, secondWordIdx) : secondWordIdx); // @BUGBUG: reverseMap is only correct if factoredVocab_->getGroupRange(0).first == 0
         std::vector<size_t> firstFactorIndices; factoredVocab->word2factors(firstWord, firstFactorIndices);
         std::vector<size_t> secondFactorIndices; factoredVocab->word2factors(secondWord, secondFactorIndices);
         //LOG(info, "{} + {} ({}) -> {} -> {}",
@@ -122,8 +122,8 @@ Beams BeamSearch::toHyps(const std::vector<uint64_t>& nBestKeys, // [currentDimB
       }
     }
     else if (shortlist) {
-      firstWord = Word::fromWordIndex(shortlist->reverseMap(firstWordIdx));
-      secondWord = Word::fromWordIndex(shortlist->reverseMap(secondWordIdx));
+      firstWord = Word::fromWordIndex(shortlist->reverseMap((int) prevBeamHypIdx, (int) currentBatchIdx, firstWordIdx));
+      secondWord = Word::fromWordIndex(shortlist->reverseMap((int) prevBeamHypIdx, (int) currentBatchIdx, secondWordIdx));
     }
     else {
       firstWord = Word::fromWordIndex(firstWordIdx);
