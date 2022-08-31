@@ -2,6 +2,6 @@
 
 namespace marian {
 
-History::History(size_t lineNo, float alpha, float wp)
-    : lineNo_(lineNo), alpha_(alpha), wp_(wp) {}
+History::History(size_t lineNo, Word eosId, float alpha, float wp)
+    : lineNo_(lineNo), eosId_(eosId), alpha_(alpha), wp_(wp) {}
 }  // namespace marian

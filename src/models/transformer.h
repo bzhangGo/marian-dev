@@ -926,7 +926,30 @@ public:
     // Used for position embeddings and creating new decoder states.
     int startPos = (int)state->getPosition();
 
-    auto scaledEmbeddings = addSpecialEmbeddings(embeddings, startPos);
+    // IBDecoder: not change the positional encoding here because of
+    //   1) Change the source code to make it compatible to ibdecoder is non-trival
+    //   2) When Average/Recurrent decoder is applied, the impact of pos-encoding decreases
+    // Let's do this in a tricky way
+    auto zeroEmbeddings = graph_->zeros(embeddings->shape());
+    // shift the position by 1
+    zeroEmbeddings = addSpecialEmbeddings(zeroEmbeddings, inference_? startPos/2+1 : startPos+1);
+
+    int dimWords = embeddings->shape()[-3];
+    int dimEmb   = embeddings->shape()[-1];
+    std::vector<IndexType> positions(dimWords); std::vector<float> signs(dimWords);
+    for(int i = 0; i < dimWords; ++ i) {
+      signs[i] = ((i + startPos) % 2 == 0 ? 1.0f : -1.0f);  // 1, -1, 1, -1
+      if(!inference_)
+        positions[i] = (i + startPos)/2;                      // 0, 0, 1, 1, 2, 2
+      else
+        positions[i] = 0;
+    }
+    auto signVector = graph_->constant({dimWords, 1, 1}, inits::fromVector(signs));
+    auto scaledEmbeddings = index_select(zeroEmbeddings, -3, positions);
+
+    float scaleFactor = std::sqrt((float)dimEmb);
+    scaledEmbeddings = scaleFactor * embeddings + scaledEmbeddings * signVector;
+    // auto scaledEmbeddings = addSpecialEmbeddings(embeddings, startPos); // TODO1
     scaledEmbeddings = atleast_nd(scaledEmbeddings, 4);
 
     // reorganize batch and timestep
@@ -1088,7 +1111,8 @@ public:
       nextState = New<TransformerState>(
         decoderStates, logits, state->getEncoderStates(), state->getBatch());
     }
-    nextState->setPosition(state->getPosition() + 1);
+    // IBDecoder: change position offset 1->2
+    nextState->setPosition(state->getPosition() + 2);
     return nextState;
   }
 
